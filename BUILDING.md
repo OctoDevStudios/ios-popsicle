@@ -6,7 +6,7 @@ Requirements: a Xiaomi 17 Pro Max with an unlocked bootloader and root under And
 
 Run `.github/workflows/xnu.yml` on your fork with `machine_config=PANDORA`. It builds xnu-8796 with `xnu/patches/` applied in order and needs `xnu/vendor/nw_all.o` (step 2) for the Wi-Fi driver. Its artifacts `xnu-kernel`, `xnu-objects` and `xnu-buildtree` allow local relinks.
 
-Once you have those artifacts, you can rebuild on an Apple Silicon Mac with only the Command Line Tools. Unpack them into a work folder, with `ci.log` from the run, the objects in `obj/` and `linklibs/`, and the build tree in `bt/`. Then:
+Once you have those artifacts, you can rebuild on an Apple Silicon Mac. Install Xcode 15.0.1 as `/Applications/Xcode_15.0.1.app` and accept its license: the scripts use it through `DEVELOPER_DIR`, and with the same Wi-Fi object the result matches the CI kernel's code and data byte for byte. Unpack them into a work folder, with `ci.log` from the run, the objects in `obj/` and `linklibs/`, and the build tree in `bt/`. Then:
 
 ```bash
 python3 -I mac/kernel_cc.py WORK OUT bsd/dev/pandora_wlan.c
@@ -16,7 +16,7 @@ python3 -I mac/kernel_cc.py WORK OUT bsd/dev/pandora_wlan.c
 python3 -I mac/relink_kernel.py WORK xnu/vendor/nw_all.o KERNEL_OUT --overlay OUT
 ```
 
-Use `--all` to recompile every file it has a command for. On an 8-core M1, `--all` took about a minute. Edit the sources in `WORK/bt/xnu`, keep your changes as patches in `xnu/patches/`, and regenerate through CI if you change `.iig`, `.defs` or headers used everywhere.
+Use `--all` to recompile every file it has a command for. On an 8-core M1, `--all` takes about 75 seconds. Edit the sources in `WORK/bt/xnu`, keep your changes as patches in `xnu/patches/`, and regenerate through CI if you change `.iig`, `.defs` or headers used everywhere.
 
 ## 2. Wi-Fi driver
 
