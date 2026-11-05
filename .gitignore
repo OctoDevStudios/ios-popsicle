@@ -1,0 +1,39 @@
+# Never commit: phone partition backups, device dumps, third-party/Apple sources, build output.
+/backup/
+/ref/
+/device/*
+!/device/*.md
+*.img
+*.dtb
+*.ipsw
+*.tar
+*.log
+out/
+outq/
+__pycache__/
+/tools/pinfile/pinfile
+out-root/
+
+# Local test payloads
+shim/loader/tctest/
+*.bin
+# macOS pipeline outputs (Apple code, phone data)
+mac/out/
+mac/extents/
+mac/logs/
+tools/pinfile/pinfile
+mac/out-gpu/
+*.mdt
+*.b[0-9][0-9]
+*.elf
+*.ipsw
+*.img
+*.im4p
+*.trustcache
+kernelcache*
+mac/logs/
+mac/out/
+mac/out-gpu/
+mac/extents/
+backup*/
+xnu/vendor/nw_all.o

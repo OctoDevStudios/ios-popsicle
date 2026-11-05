@@ -1,0 +1,70 @@
+xnu 0351: Wi-Fi: the boot ROM report (window registers, ROM log) when the image is refused; modem: well-formed QRTR HELLO
+
+--- a/bsd/dev/pandora_adsp.c	2026-11-04 20:16:16
++++ b/bsd/dev/pandora_adsp.c	2026-11-04 20:16:16
+@@ -3307,7 +3307,8 @@
+ static void
+ ms_qrtr_send_hello(QcomGlinkChannel *ch)
+ {
+-	static const uint32_t pkt[10] = {1, 2, 1, 0xfffffffeu, 0, 8, 0, 0xfffffffeu, 2, 0};    /* HELLO from node 1 */
++	/* 0351: as qrtr_send_hello: to the broadcast node, the 20 byte control packet (t12: the modem did not react). */
++	static const uint32_t pkt[13] = {1, 2, 1, 0xfffffffeu, 0, 20, 0xffffffffu, 0xfffffffeu, 2, 0, 0, 0, 0};
+ 	int e = qcom_glink_send(&ed_modem.gl, ch, pkt, sizeof(pkt));
+ 	printf("PANDORA MODEM: QRTR HELLO sent -> %d\n", e);
+ }
+--- a/bsd/dev/pandora_wlan.c	2026-11-04 20:16:16
++++ b/bsd/dev/pandora_wlan.c	2026-11-04 20:16:16
+@@ -481,7 +481,7 @@
+ 	set(dbi, WL_CFG_OFF + 0x04, 2u);        /* endpoint: memory */
+ 	delay(100);
+ 	printf("PANDORA WLAN: BAR0 now %#x, command %#x\n", rd(dbi, WL_CFG_OFF + 0x10), rd(dbi, WL_CFG_OFF + 4));
+-	vm_offset_t mhi = wl_map(0x40400000ull, 0x2000);
++	vm_offset_t mhi = wl_map(0x40400000ull, 0x100000);     /* with the register window */
+ 	if (!mhi) {
+ 		return ENOMEM;
+ 	}
+@@ -540,6 +540,33 @@
+ {
+ 	printf("PANDORA WLAN: %s: EE %#x BHI status %#x error %#x %#x, MHI control %#x status %#x\n", when,
+ 	    rd(mhi, bhi + 0x28), rd(mhi, bhi + 0x2c), rd(mhi, bhi + 0x30), rd(mhi, bhi + 0x34), rd(mhi, 0x38), rd(mhi, 0x48));
++}
++
++/* 0351: cnss_pci_dump_bl_sram_mem, peach: what the chip's boot ROM says, through the register window (reg.h). */
++static uint32_t
++wf_reg(vm_offset_t bar, uint32_t off)
++{
++	if (off < 0x80000u) {
++		return rd(bar, off);
++	}
++	wr(bar, 0x3278, 0x40000000u | ((off >> 19) & 0x3fu));
++	(void)rd(bar, 0x3278);
++	return rd(bar, 0x80000u + (off & 0x7ffffu));
++}
++
++static void
++wf_rom_report(vm_offset_t bar, uint32_t bhi)
++{
++	printf("PANDORA WLAN: ROM: hardware version %#x, stage %#x, boot config %#x, bootstrap %#x, BHI error regs %#x %#x %#x %#x, antirollback %#x\n",
++	    rd(bar, 0x224), wf_reg(bar, 0x01b000f8), wf_reg(bar, 0x01e22b34), wf_reg(bar, 0x01a10008),
++	    rd(bar, bhi + 0x30), rd(bar, bhi + 0x34), rd(bar, bhi + 0x38), rd(bar, bhi + 0x3c), rd(bar, bhi + 0x44));
++	for (uint32_t i = 0; i < 40; i += 4) {
++		printf("PANDORA WLAN: ROM log[%u] = %#x\n", i, wf_reg(bar, 0x01403640u + i));
++	}
++	printf("PANDORA WLAN: chip id %#x %#x %#x %#x %#x %#x, key hash %#x %#x %#x %#x\n", rd(bar, bhi + 0x4c), rd(bar, bhi + 0x50),
++	    rd(bar, bhi + 0x54), rd(bar, bhi + 0x58), rd(bar, bhi + 0x5c), rd(bar, bhi + 0x60), rd(bar, bhi + 0x64), rd(bar, bhi + 0x68),
++	    rd(bar, bhi + 0x6c), rd(bar, bhi + 0x70));
++	(void)pandora_log_sync();
+ }
+ 
+ static int
+@@ -603,7 +630,10 @@
+ 	wf_state(mhi, bhi, "after BHI");
+ 	(void)pandora_smmu_report("after BHI");
+ 	(void)pandora_log_sync();
++	wf_rom_report(mhi, bhi);
+ 	if (st != 2) {
++		const volatile uint32_t *w = (const volatile uint32_t *)fw;
++		printf("PANDORA WLAN: image in memory starts %08x %08x %08x %08x; at 0x3000 %08x %08x\n", w[0], w[1], w[2], w[3], w[0x3000 / 4], w[0x3004 / 4]);
+ 		return EIO;
+ 	}
+ 

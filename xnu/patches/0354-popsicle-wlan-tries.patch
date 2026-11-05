@@ -1,0 +1,199 @@
+xnu 0354: Wi-Fi: MSI on as Android; up to four firmware tries in one boot (power cycle, SOL line, rf_clk, Gen1); rails back to t13's
+
+--- a/bsd/dev/pandora_adsp.c	2026-11-04 21:13:49
++++ b/bsd/dev/pandora_adsp.c	2026-11-04 21:13:49
+@@ -417,11 +417,18 @@
+ /* One VRM (rpmh-regulator order: voltage, mode, enable) for bsd/dev/pandora_wlan.c. mode < 0 leaves it alone. */
+ int pandora_rpmh_vrm(const char *res, uint32_t mv, int mode);
+ int pandora_rpmh_clk(const char *res);
++int pandora_rpmh_clk_set(const char *res, uint32_t on);
+ 
+ /* clk-rpmh.c, DEFINE_CLK_RPMH_VRM: the enable word of an RPMh clock resource (rfclka1 etc.). */
+ int
+ pandora_rpmh_clk(const char *res)
+ {
++	return pandora_rpmh_clk_set(res, 1);
++}
++
++int
++pandora_rpmh_clk_set(const char *res, uint32_t on)
++{
+ 	uint32_t addr, aux, len;
+ 	if (!ad_rsc) {
+ 		ad_rsc = ad_map(AD_RSC_PA, 0x10000, VM_WIMG_IO);
+@@ -430,7 +437,7 @@
+ 		ad_db = ad_map(AD_CMDDB_PA, AD_CMDDB_SIZE, VM_WIMG_IO);
+ 	}
+ 	int e = cmddb_find(res, &addr, &aux, &len);
+-	return e ? e : rpmh_write1(addr + 4, 1);
++	return e ? e : rpmh_write1(addr + 4, on);
+ }
+ 
+ int
+--- a/bsd/dev/pandora_wlan.c	2026-11-04 21:13:49
++++ b/bsd/dev/pandora_wlan.c	2026-11-04 21:13:49
+@@ -31,6 +31,7 @@
+ extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);
+ extern int pandora_rpmh_vrm(const char *res, uint32_t mv, int mode);
+ extern int pandora_rpmh_clk(const char *res);
++extern int pandora_rpmh_clk_set(const char *res, uint32_t on);
+ extern int pandora_part_file(const char *name, void *dst, uint64_t max, uint64_t *size);
+ extern int pandora_smmu_pass(uint16_t id, uint16_t mask);
+ extern int pandora_smmu_report(const char *when);
+@@ -79,6 +80,8 @@
+ static inline void clr(vm_offset_t b, uint32_t o, uint32_t bits) { wr(b, o, rd(b, o) & ~bits); }
+ 
+ static int wf_boot(vm_offset_t mhi, uint32_t bhi);
++static void wf_msi(void);
++static int wf_again(unsigned variant);
+ 
+ static vm_offset_t
+ wl_map(uint64_t pa, uint64_t len)
+@@ -134,8 +137,8 @@
+ 		{"L3K_E1", 1200, 7},
+ 		{"L2G_E0", 1800, 7},
+ 		{"S2J_E1", 892, -1},
+-		{"S8F_E0", 1876, -1},           /* 0353: cnss log: rfa1 min 1876000; the 1800 of regulator_summary is BT's */
+-		{"S7F_E0", 1328, -1},           /* 0353: cnss log: rfa2 min 1328000 */
++		{"S8F_E0", 1800, -1},           /* 0354: t15: 1876 changed nothing for the chip */
++		{"S7F_E0", 1224, -1},
+ 		{"S1J_E1", 892, -1},
+ 	};
+ 	for (unsigned i = 0; i < sizeof(rails) / sizeof(rails[0]); i++) {
+@@ -494,8 +497,17 @@
+ 		    rd(mhi, bhi + 4), rd(mhi, bhi), rd(mhi, bhi + 0x28), rd(mhi, bhi + 0x2c), rd(mhi, bhi + 0x30),
+ 		    rd(mhi, bhi + 0x34), rd(mhi, bhi + 0x38));
+ 		if (rd(mhi, bhi + 0x28) == 0) {
+-			int fe = wf_boot(mhi, bhi);
+-			printf("PANDORA WLAN: firmware step -> %d\n", fe);
++			int fe = EIO;
++			for (unsigned v = 0; v < 4 && fe; v++) {
++				if (v && wf_again(v) != 0) {
++					fe = EIO;
++					continue;       /* no link this way: the next try still has its chance */
++				}
++				wf_msi();
++				fe = wf_boot(mhi, bhi);
++				printf("PANDORA WLAN: try %u: firmware step -> %d\n", v, fe);
++				(void)pandora_log_sync();
++			}
+ 		}
+ 	}
+ 	return 0;
+@@ -540,6 +552,87 @@
+ {
+ 	printf("PANDORA WLAN: %s: EE %#x BHI status %#x error %#x %#x, MHI control %#x status %#x\n", when,
+ 	    rd(mhi, bhi + 0x28), rd(mhi, bhi + 0x2c), rd(mhi, bhi + 0x30), rd(mhi, bhi + 0x34), rd(mhi, 0x38), rd(mhi, 0x48));
++}
++
++/* 0354: the chip's MSI on, as Android has it: pci_alloc_irq_vectors + the MSI capability; the write lands in our RAM. */
++static void
++wf_msi(void)
++{
++	uint32_t cap = rd(dbi, WL_CFG_OFF + 0x34) & 0xff;
++	for (unsigned i = 0; cap && i < 32; i++) {
++		const uint32_t h = rd(dbi, WL_CFG_OFF + cap);
++		if ((h & 0xff) == 5) {
++			const bool is64 = (h & (1u << 23)) != 0;
++			const uint64_t a = WF_LOW_CTX + 0x38000;
++			wr(dbi, WL_CFG_OFF + cap + 4, (uint32_t)a);
++			if (is64) {
++				wr(dbi, WL_CFG_OFF + cap + 8, (uint32_t)(a >> 32));
++			}
++			wr(dbi, WL_CFG_OFF + cap + (is64 ? 12 : 8), 0);
++			wr(dbi, WL_CFG_OFF + cap, h | (1u << 16));
++			printf("PANDORA WLAN: MSI at %#x: was %#x, now %#x, 64 bit %d, address %#llx\n", cap, h, rd(dbi, WL_CFG_OFF + cap), is64, a);
++			return;
++		}
++		cap = (h >> 8) & 0xff;
++	}
++	printf("PANDORA WLAN: no MSI capability\n");
++}
++
++/* 0354: the same chip, off and on, link again: tries of one boot instead of one test each. */
++static int
++wf_again(unsigned variant)
++{
++	clr(parf, 0x1b0, 1u << 8);
++	wl_gpio(GPIO_PERST, 0x200u | 1u, 0);
++	wl_gpio(GPIO_WLAN_EN, 0x200u | (7u << 6) | 3u, 0);
++	wl_sleep(200);
++	switch (variant) {
++	case 1:
++		printf("PANDORA WLAN: try 1: host SOL line left alone\n");
++		wl_gpio(GPIO_HOST_SOL, 0, -1);
++		break;
++	case 2:
++		wl_gpio(GPIO_HOST_SOL, 0x200u, 0);
++		printf("PANDORA WLAN: try 2: no rf_clk vote -> %d (Android: no need enable clk)\n", pandora_rpmh_clk_set("C1A_E0", 0));
++		break;
++	case 3:
++		printf("PANDORA WLAN: try 3: link at Gen1; rf_clk back -> %d\n", pandora_rpmh_clk_set("C1A_E0", 1));
++		wr(dbi, 0x70 + 0x30, (rd(dbi, 0x70 + 0x30) & ~0xfu) | 1u);
++		break;
++	default:
++		break;
++	}
++	wl_gpio(GPIO_WLAN_EN, 0x200u | (7u << 6) | 3u, 1);
++	wl_sleep(100);
++	wl_gpio(GPIO_PERST, 0x200u | 1u, 1);
++	wl_sleep(10);
++	(void)pandora_log_sync();
++	set(parf, 0x1b0, 1u << 8);
++	uint32_t st = 0, lnk = 0;
++	bool up = false;
++	for (unsigned i = 0; i < 1000 && !up; i++) {
++		st = rd(dbi, WL_ELBI_OFF + 8);
++		lnk = rd(dbi, 0x70 + 0x10);
++		up = (st & 0x400u) && (lnk & (1u << 29));
++		if (!up) {
++			wl_sleep(1);
++		}
++	}
++	printf("PANDORA WLAN: try %u: link %d status %#x link register %#x\n", variant, up, st, lnk);
++	if (!up) {
++		return ETIMEDOUT;
++	}
++	wl_sleep(100);
++	const uint32_t id = rd(dbi, WL_CFG_OFF);
++	if (id != WLAN_ID) {
++		printf("PANDORA WLAN: try %u: id %#x\n", variant, id);
++		return EIO;
++	}
++	wr(dbi, WL_CFG_OFF + 0x10, 0x40400000u);
++	wr(dbi, WL_CFG_OFF + 0x14, 0);
++	set(dbi, WL_CFG_OFF + 0x04, 6u);
++	delay(100);
++	return 0;
+ }
+ 
+ /* 0351: cnss_pci_dump_bl_sram_mem, peach: what the chip's boot ROM says, through the register window (reg.h). */
+@@ -575,16 +668,25 @@
+ 	const uint32_t bhie = rd(mhi, 0x2c), chdb = rd(mhi, 0x18), erdb = rd(mhi, 0x20);
+ 	const uint64_t fw_pa = WF_LOW_FW, ctx_pa = WF_LOW_CTX;
+ 	uint64_t size = 0;
+-	int e = pandora_smmu_pass(0x1400, 0x7f);
++	static bool passed;
++	int e = passed ? 0 : pandora_smmu_pass(0x1400, 0x7f);
+ 	printf("PANDORA WLAN: SMMU -> %d; BDF to SID config %#x\n", e, rd(parf, 0x2c00));
+ 	if (e) {
+ 		return e;
+ 	}
++	passed = true;
+ 	set(dbi, WL_CFG_OFF + 0x04, 6u);        /* memory, bus master */
+ 	wl_mark("before the firmware memory");
+-	const vm_offset_t fw = wf_low(fw_pa, WF_MAX);
++	static vm_offset_t fw_map, ctx_map;
++	if (!fw_map) {
++		fw_map = wf_low(fw_pa, WF_MAX);
++	}
++	if (!ctx_map) {
++		ctx_map = wf_low(ctx_pa, 0x40000);
++	}
++	const vm_offset_t fw = fw_map;
+ 	/* One block: contexts, rings, vector table. */
+-	const vm_offset_t ctx = wf_low(ctx_pa, 0x40000);
++	const vm_offset_t ctx = ctx_map;
+ 	if (!fw || !ctx) {
+ 		return ENOMEM;
+ 	}

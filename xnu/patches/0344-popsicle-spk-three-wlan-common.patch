@@ -1,0 +1,74 @@
+xnu 0344: popsicle speaker endpoint is 3 channels, slot mask 7; read CRM parameters from "common"
+
+--- a/bsd/dev/pandora_adsp.c	2026-11-04 17:24:05
++++ b/bsd/dev/pandora_adsp.c	2026-11-04 17:24:05
+@@ -1958,7 +1958,10 @@
+ 	bzero(d, sizeof(d));
+ 	spk_put32(d, 48000);
+ 	spk_put16(d + 4, 32);
+-	spk_put16(d + 6, spk_ii.ch);
++	/* 0344: popsicle's speaker backend is three channels (backend_conf.xml TDM-LPAIF-RX-PRIMARY ch=3; rm.xml
++	 * group_dev channels=3 slot_mask=7, devicepp_mfc channels=2; the ACDB's module 0x4c3b outputs 3): the stream
++	 * stays stereo, the endpoint and the slots are three. t7: buffers consumed, amps' AUDIO_IN_MAX 0 with two. */
++	spk_put16(d + 6, spk_cur != SpkReceiver ? 3 : spk_ii.ch);
+ 	spk_put32(d + 8, 1);
+ 	spk_add_oob("TDM media format", APM_CMD_SET_CFG, b, spk_param(b, spk_ii.tdm, 0x08001017u, d, 12), false);
+ 	/* 0304: the backend's LPAIF type and interface index in PARAM_ID_TDM_INTF_CFG, as AGM's configure_tdm_ep fills
+@@ -1976,6 +1979,9 @@
+ 				}
+ 				spk_put32(t + o + 16, 0);
+ 				spk_put32(t + o + 20, 0);
++				if (spk_cur != SpkReceiver && n >= 16) {
++					spk_put32(t + o + 28, 7);      /* slot_mask: as group_dev (0344) */
++				}
+ 			}
+ 			o += 16 + ((n + 7u) & ~7u);
+ 		}
+--- a/bsd/dev/pandora_wlan.c	2026-11-04 17:24:05
++++ b/bsd/dev/pandora_wlan.c	2026-11-04 17:24:05
+@@ -34,6 +34,8 @@
+ #define WL_PHY_PA    0x01c06000ull
+ #define WL_CRM_PA    0x01d01000ull      /* base */
+ #define WL_CRMC_PA   0x01d03800ull      /* crm_c */
++#define WL_COMMON_PA 0x01d05000ull      /* the page of "common", at 0x1d05e00: version, parameters, enable */
++#define WL_COMMON_OFF 0xe00u
+ #define WL_SM_PA     0x01d07000ull
+ #define WL_DBI_PA    0x400000000ull
+ #define WL_ELBI_OFF  0xf20u
+@@ -48,7 +50,7 @@
+ #define PERF_LVL_GEN3 4u                /* PERF_LVL_GEN1 is 2 in msm_pcie_cesta_perf_idx */
+ #define WLAN_ID      0x110e17cbu
+ 
+-static vm_offset_t gcc, parf, phy, crm, crmc, sm, dbi, atu;
++static vm_offset_t gcc, parf, phy, crm, crmc, crmcom, sm, dbi, atu;
+ static int wl_chan;
+ 
+ static inline uint32_t rd(vm_offset_t b, uint32_t o) { return *(volatile uint32_t *)(b + o); }
+@@ -134,12 +136,13 @@
+ static int
+ wl_crm_vote(uint32_t perf)
+ {
+-	const uint32_t cfg = rd(crm, 4);
++	/* 0344: version and parameters are in "common", not "base" (crm_probe_drvs); t7 read zeros from base */
++	const uint32_t cfg = rd(crmcom, WL_COMMON_OFF + 4);
+ 	const uint32_t vcds = (cfg >> 6) & 0xf, states = cfg & 0xf;
+ 	const uint32_t update = rd(crm, 0x374);
+ 	const uint32_t ch = (update & 1) ? 1 : 0;
+-	printf("PANDORA WLAN: CRM version %#x cfg %#x: %u VCDs, %u power states; channel update %#x, voting on %u\n",
+-	    rd(crm, 0), cfg, vcds, states, update, ch);
++	printf("PANDORA WLAN: CRM version %#x cfg %#x enable %#x: %u VCDs, %u power states; channel update %#x, voting on %u\n",
++	    rd(crmcom, WL_COMMON_OFF), cfg, rd(crmcom, WL_COMMON_OFF + 0xc), vcds, states, update, ch);
+ 	if (vcds == 0 || vcds > 8 || states < 2 || states > 5) {
+ 		return EINVAL;
+ 	}
+@@ -191,8 +194,9 @@
+ 	gcc = wl_map(WL_GCC_PA, 0x80000);
+ 	crm = wl_map(WL_CRM_PA, 0x2000);
+ 	crmc = wl_map(WL_CRMC_PA, 0x2000);
++	crmcom = wl_map(WL_COMMON_PA, 0x1000);
+ 	sm = wl_map(WL_SM_PA, 0x7000);
+-	if (!gcc || !crm || !crmc || !sm) {
++	if (!gcc || !crm || !crmc || !crmcom || !sm) {
+ 		return ENOMEM;
+ 	}
+ 

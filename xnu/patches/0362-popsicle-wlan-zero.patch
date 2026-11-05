@@ -1,0 +1,13 @@
+xnu 0362: Wi-Fi board: zeroed allocations
+
+--- a/bsd/dev/pandora_wlan.c	2026-11-04 23:11:25
++++ b/bsd/dev/pandora_wlan.c	2026-11-04 23:11:25
+@@ -1143,7 +1143,7 @@
+ }
+ static void *nw_alloc(size_t n)
+ {
+-	uint64_t *p = kalloc_data(n + 16, Z_WAITOK);
++	uint64_t *p = kalloc_data(n + 16, Z_WAITOK | Z_ZERO);
+ 	if (p) {
+ 		p[0] = n + 16;
+ 		return p + 2;

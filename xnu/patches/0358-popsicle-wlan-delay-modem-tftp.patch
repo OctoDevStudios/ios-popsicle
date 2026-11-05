@@ -1,0 +1,307 @@
+xnu 0358: Wi-Fi: RDDM vectors and Android's delay before M0; modem: small TFTP server (read-only firmware, RAM for readwrite), locator entry
+
+--- a/bsd/dev/pandora_adsp.c	2026-11-04 22:14:04
++++ b/bsd/dev/pandora_adsp.c	2026-11-04 22:14:04
+@@ -3401,6 +3401,234 @@
+ }
+ 
+ static uint32_t ms_other_shown;
++static void ms_raw_reply(const uint8_t *req, const uint8_t *p, uint32_t n);
++
++/*
++ * 0358: tqftpserv in small: /readonly/firmware from the read-only firmware partition already mounted, /readwrite in RAM
++ * only (gone at the next boot), nothing else. wsize 1 and a block size that fits one message, whatever is asked.
++ */
++#define TF_BLK_MAX   3584u
++#define TF_STORE_PA  0xe5000000ull      /* 16 files of 1 MiB */
++#define TF_STORE_SZ  0x100000u
++static struct {
++	char name[72];
++	uint8_t *mem;
++	uint32_t size;
++	bool used;
++} tf_store[16];
++static struct {
++	uint32_t port;
++	bool active, write, fat;
++	int file;
++	struct fw_file ff;
++	uint64_t size, seek, rsize;
++	uint32_t blk;
++	uint16_t expected;
++} tf_c[16];
++static uint32_t tf_shown;
++
++static int
++tf_find(const char *name, bool make)
++{
++	for (int i = 0; i < 16; i++) {
++		if (tf_store[i].used && !strcmp(tf_store[i].name, name)) {
++			return i;
++		}
++	}
++	if (!make) {
++		return -1;
++	}
++	for (int i = 0; i < 16; i++) {
++		if (!tf_store[i].used) {
++			tf_store[i].mem = (uint8_t *)ad_map(TF_STORE_PA + (uint64_t)i * TF_STORE_SZ, TF_STORE_SZ, VM_WIMG_WCOMB);
++			if (!tf_store[i].mem) {
++				return -1;
++			}
++			strlcpy(tf_store[i].name, name, sizeof(tf_store[i].name));
++			tf_store[i].size = 0;
++			tf_store[i].used = true;
++			return i;
++		}
++	}
++	return -1;
++}
++
++static void
++tf_error(const uint8_t *req, uint8_t code, const char *msg)
++{
++	uint8_t e[64] = {0, 5, 0, code};
++	strlcpy((char *)e + 4, msg, 58);
++	ms_raw_reply(req, e, 4 + (uint32_t)strlen(msg) + 1);
++}
++
++/* The block after `last`, or nothing when the file has ended. */
++static void
++tf_send_block(const uint8_t *req, int c, uint32_t last)
++{
++	static uint8_t b[TF_BLK_MAX + 4];
++	const uint64_t off = tf_c[c].seek + (uint64_t)last * tf_c[c].blk;
++	uint64_t n = off < tf_c[c].size ? MIN((uint64_t)tf_c[c].blk, tf_c[c].size - off) : 0;
++	if (tf_c[c].rsize && (uint64_t)(last + 1) * tf_c[c].blk > tf_c[c].rsize) {
++		n = MIN(n, tf_c[c].rsize % tf_c[c].blk);
++	}
++	b[0] = 0;
++	b[1] = 3;
++	b[2] = (uint8_t)((last + 1) >> 8);
++	b[3] = (uint8_t)(last + 1);
++	if (n) {
++		if (tf_c[c].fat) {
++			if (fw_pread(&tf_c[c].ff, off, b + 4, n)) {
++				tf_error(req, 0, "read error");
++				tf_c[c].active = false;
++				return;
++			}
++		} else {
++			memcpy(b + 4, tf_store[tf_c[c].file].mem + off, (size_t)n);
++		}
++	}
++	ms_raw_reply(req, b, 4 + (uint32_t)n);
++	if (n < tf_c[c].blk) {
++		tf_c[c].active = false;
++	}
++}
++
++static void
++tf_handle(const uint8_t *m, uint32_t len)
++{
++	uint32_t from;
++	memcpy(&from, m + 12, 4);
++	const uint8_t *p = m + 32;
++	const uint32_t n = len - 32;
++	const uint16_t op = (uint16_t)(p[0] << 8 | p[1]);
++	int c = -1;
++	for (int i = 0; i < 16; i++) {
++		if (tf_c[i].active && tf_c[i].port == from) {
++			c = i;
++		}
++	}
++	if (op == 1 || op == 2) {
++		char name[72] = "", mode[12] = "";
++		uint32_t o = 2;
++		strlcpy(name, (const char *)p + o, MIN(sizeof(name), (size_t)(n - o)));
++		o += (uint32_t)strnlen((const char *)p + o, n - o) + 1;
++		if (o < n) {
++			strlcpy(mode, (const char *)p + o, MIN(sizeof(mode), (size_t)(n - o)));
++			o += (uint32_t)strnlen((const char *)p + o, n - o) + 1;
++		}
++		uint64_t want_blk = 512, seek = 0, rsize = 0;
++		bool has_opts = o < n, want_tsize = false, want_timeout = false, want_wsize = false, want_blkopt = false, want_rsize = false, want_seek = false;
++		uint64_t timeout = 1000;
++		while (o < n) {
++			const char *k = (const char *)p + o;
++			o += (uint32_t)strnlen(k, n - o) + 1;
++			if (o >= n) {
++				break;
++			}
++			const char *v = (const char *)p + o;
++			o += (uint32_t)strnlen(v, n - o) + 1;
++			uint64_t val = 0;
++			for (const char *q = v; *q >= '0' && *q <= '9'; q++) {
++				val = val * 10 + (uint64_t)(*q - '0');
++			}
++			if (!strcmp(k, "blksize")) { want_blk = val; want_blkopt = true; }
++			else if (!strcmp(k, "tsize")) { want_tsize = true; }
++			else if (!strcmp(k, "wsize")) { want_wsize = true; }
++			else if (!strcmp(k, "timeoutms")) { timeout = val; want_timeout = true; }
++			else if (!strcmp(k, "rsize")) { rsize = val; want_rsize = true; }
++			else if (!strcmp(k, "seek")) { seek = val; want_seek = true; }
++		}
++		if (tf_shown++ < 80) {
++			printf("PANDORA MODEM: TFTP %s %s from port %u (block %llu, seek %llu, rsize %llu)\n", op == 1 ? "read" : "write", name, from, want_blk, seek, rsize);
++		}
++		if (c < 0) {
++			for (int i = 0; i < 16 && c < 0; i++) {
++				if (!tf_c[i].active) {
++					c = i;
++				}
++			}
++		}
++		if (c < 0) {
++			tf_error(m, 0, "busy");
++			return;
++		}
++		bzero(&tf_c[c], sizeof(tf_c[c]));
++		tf_c[c].port = from;
++		tf_c[c].blk = (uint32_t)MIN(MAX(want_blk, (uint64_t)8), (uint64_t)TF_BLK_MAX);
++		tf_c[c].seek = seek;
++		tf_c[c].rsize = rsize;
++		tf_c[c].write = op == 2;
++		if (op == 1 && !strncmp(name, "/readonly/firmware/image/", 25)) {
++			if (fw_open(name + 25, true, &tf_c[c].ff)) {
++				tf_error(m, 1, "file not found");
++				return;
++			}
++			tf_c[c].fat = true;
++			tf_c[c].size = tf_c[c].ff.size;
++		} else if (op == 1) {
++			tf_c[c].file = tf_find(name, false);
++			if (tf_c[c].file < 0) {
++				tf_error(m, 1, "file not found");
++				return;
++			}
++			tf_c[c].size = tf_store[tf_c[c].file].size;
++		} else {
++			if (strncmp(name, "/readwrite/", 11) || (tf_c[c].file = tf_find(name, true)) < 0) {
++				tf_error(m, 2, "access violation");
++				return;
++			}
++			tf_store[tf_c[c].file].size = 0;     /* RAM only */
++			tf_c[c].expected = 1;
++		}
++		tf_c[c].active = true;
++		if (!has_opts) {
++			if (op == 1) {
++				tf_send_block(m, c, 0);
++			} else {
++				const uint8_t ack[4] = {0, 4, 0, 0};
++				ms_raw_reply(m, ack, 4);
++			}
++			return;
++		}
++		static char oack[256];
++		uint32_t ol = 2;
++		oack[0] = 0;
++		oack[1] = 6;
++#define TF_OPT(key, val) do { ol += (uint32_t)strlcpy(oack + ol, key, sizeof(oack) - ol) + 1; ol += (uint32_t)snprintf(oack + ol, sizeof(oack) - ol, "%llu", (unsigned long long)(val)) + 1; } while (0)
++		if (want_blkopt) { TF_OPT("blksize", tf_c[c].blk); }
++		if (want_timeout) { TF_OPT("timeoutms", timeout); }
++		if (want_tsize) { TF_OPT("tsize", tf_c[c].size); }
++		if (want_wsize) { TF_OPT("wsize", 1); }
++		if (want_rsize) { TF_OPT("rsize", rsize); }
++		if (want_seek) { TF_OPT("seek", seek); }
++#undef TF_OPT
++		ms_raw_reply(m, (const uint8_t *)oack, ol);
++		return;
++	}
++	if (c < 0) {
++		return;
++	}
++	if (op == 4 && n >= 4 && !tf_c[c].write) {
++		tf_send_block(m, c, (uint32_t)(p[2] << 8 | p[3]));
++	} else if (op == 3 && n >= 4 && tf_c[c].write) {
++		const uint16_t blk = (uint16_t)(p[2] << 8 | p[3]);
++		const uint32_t pl = n - 4;
++		const uint64_t off = (uint64_t)(blk ? blk - 1 : 0) * tf_c[c].blk;
++		if (off + pl <= TF_STORE_SZ) {
++			memcpy(tf_store[tf_c[c].file].mem + off, p + 4, pl);
++			tf_store[tf_c[c].file].size = MAX(tf_store[tf_c[c].file].size, (uint32_t)(off + pl));
++		}
++		const uint8_t ack[4] = {0, 4, p[2], p[3]};
++		ms_raw_reply(m, ack, 4);
++		if (pl < tf_c[c].blk) {
++			if (tf_shown++ < 80) {
++				printf("PANDORA MODEM: TFTP write done: %s, %u bytes kept in RAM\n", tf_store[tf_c[c].file].name, tf_store[tf_c[c].file].size);
++			}
++			tf_c[c].active = false;
++		}
++	} else if (op == 5) {
++		tf_c[c].active = false;
++	}
++}
+ 
+ /* A raw packet back to whoever asked (TFTP is not QMI). */
+ static void
+@@ -3424,14 +3652,8 @@
+ {
+ 	uint32_t port;
+ 	memcpy(&port, m + 28, 4);
+-	if (port == RFS_PORT + 2 && len > 34) {
+-		/* tqftpserv: every read refused for now, the names say what the modem wants. */
+-		char name[80] = "";
+-		const uint16_t op = (uint16_t)(m[32] << 8 | m[33]);
+-		memcpy(name, m + 34, MIN(len - 34, (uint32_t)sizeof(name) - 1));
+-		printf("PANDORA MODEM: TFTP op %u: %s\n", op, name);
+-		static const uint8_t no[] = {0, 5, 0, 1, 'n', 'o', 't', ' ', 'f', 'o', 'u', 'n', 'd', 0};
+-		ms_raw_reply(m, no, sizeof(no));
++	if (port == RFS_PORT + 2 && len >= 36) {
++		tf_handle(m, len);
+ 		return;
+ 	}
+ 	if (port != RFS_PORT && len >= 39) {
+@@ -3440,9 +3662,15 @@
+ 			printf("PANDORA MODEM: %s: QMI type %u message %#x, %u bytes: %.48s\n", port == RFS_PORT + 1 ? "service locator" : "memshare", m[32], mid, len, (const char *)m + 42);
+ 		}
+ 		/* An answer so it does not wait: locator GET_DOMAIN_LIST with no domain, else failure. */
+-		uint8_t a[32] = {2, 4, 0, 0, 0, 0, 0};
++		uint8_t a[64] = {2, 4, 0, 0, 0, 0, 0};
+ 		uint32_t al = 7;
+-		if (port == RFS_PORT + 1 && mid == 0x21) {
++		if (port == RFS_PORT + 1 && mid == 0x21 && len >= 42 + 11 && !memcmp(m + 42, "tms/servreg", 11)) {
++			/* modemr.jsn: msm/modem/root_pd, instance 180. u8 count, u8 name length, name, u32, u8, u32. */
++			static uint8_t l[64] = {0x10, 2, 0, 1, 0, 0x11, 2, 0, 1, 0, 0x12, 28, 0, 1, 17,
++			    'm', 's', 'm', '/', 'm', 'o', 'd', 'e', 'm', '/', 'r', 'o', 'o', 't', '_', 'p', 'd', 180, 0, 0, 0, 0, 0, 0, 0, 0};
++			memcpy(a + 7, l, 13 + 28);
++			al += 13 + 28;
++		} else if (port == RFS_PORT + 1 && mid == 0x21) {
+ 			static const uint8_t none[] = {0x10, 2, 0, 0, 0, 0x11, 2, 0, 1, 0, 0x12, 1, 0, 0};
+ 			memcpy(a + 7, none, sizeof(none));
+ 			al += sizeof(none);
+--- a/bsd/dev/pandora_wlan.c	2026-11-04 22:14:04
++++ b/bsd/dev/pandora_wlan.c	2026-11-04 22:14:04
+@@ -893,6 +893,20 @@
+ 		}
+ 		printf("PANDORA WLAN: image: sum32 of 512 KiB %#x (wanted 0x99142d59), last word %#x\n", sum, w[WF_SEG / 4 - 1]);
+ 	}
++	/* 0358: mhi_rddm_prepare before BHI, as Android's mhi log: 15 segments of 512 KiB, 16 bytes each in the table. */
++	{
++		struct { uint64_t pa, len; } *rv = (void *)(ctx + 0x31000);
++		const uint64_t rv_pa = ctx_pa + 0x31000;
++		for (unsigned k = 0; k < 15; k++) {
++			rv[k].pa = 0x9e000000ull + (uint64_t)k * WF_SEG;
++			rv[k].len = WF_SEG;
++		}
++		wf_flush(rv_pa, 0x1000);
++		wr(mhi, bhie + 0x64, (uint32_t)(rv_pa >> 32));
++		wr(mhi, bhie + 0x60, (uint32_t)rv_pa);
++		wr(mhi, bhie + 0x68, 15u * 16u);
++		wr(mhi, bhie + 0x70, 0x2345678);
++	}
+ 	wl_mark("before BHI");
+ 	/* mhi_async_power_up, mhi_fw_load_bhi */
+ 	wr(mhi, bhi + 0x20, 0);
+@@ -929,6 +943,9 @@
+ 	if (!(rd(mhi, 0x48) & 1u)) {
+ 		return ETIMEDOUT;
+ 	}
++	/* 0358: Android's worker comes 21 ms after READY (mhi log 5.7308 -> 5.7516); t19: M0 at once, SYS_ERR at once. */
++	wl_sleep(25);
++	wf_state(mhi, bhi, "READY + 25 ms");
+ 
+ 	/* mhi_init_dev_ctxt, mhi_init_mmio: no channel on, two event rings, the command ring. */
+ 	const uint64_t chan_pa = ctx_pa, er_pa = ctx_pa + 0x2000, cmd_pa = ctx_pa + 0x3000;

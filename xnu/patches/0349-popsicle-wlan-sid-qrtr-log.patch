@@ -1,0 +1,239 @@
+xnu 0349: Wi-Fi: BDF to SID table, DMA buffers below 4 GiB, SMMU fault report; modem: IPCRTR read side and HELLO
+
+--- a/bsd/dev/pandora_adsp.c	2026-11-04 19:09:13
++++ b/bsd/dev/pandora_adsp.c	2026-11-04 19:09:28
+@@ -3095,6 +3095,13 @@
+ 
+ /* ---- the thread ------------------------------------------------------------------------- */
+ 
++/* 0349: defined with the modem's start, below. */
++static bool ms_gl_wanted;
++static uint8_t ms_storage[4096 * 8];
++static QcomGlinkChannel *ms_ch;
++static void ms_state(void *ctx, QcomGlinkChannel *ch, int up);
++static void ms_receive(void *ctx, QcomGlinkChannel *ch, const uint8_t *d, uint32_t len);
++
+ /*
+  * Boot-args: pandora_adsp (1 TrustZone queries, 2 also start the DSP pandora_adsp_delay s after
+  * the thread starts, default 20) and pandora_battery=1 (attach to the SOCCP and read the battery,
+@@ -3164,6 +3171,16 @@
+ 			clock_interval_to_deadline(30000, NSEC_PER_MSEC, &fast_until);
+ 		}
+ 		ipcc_poll();
++		if (ms_gl_wanted) {
++			static const QcomGlinkClient ms_client = {ms_state, ms_receive};
++			ms_gl_wanted = false;
++			int ge = gl_start(&ed_modem, false);
++			printf("PANDORA MODEM: GLINK start -> %d\n", ge);
++			if (!ge) {
++				ms_ch = qcom_glink_channel(&ed_modem.gl, "IPCRTR", 4096, 8, ms_storage, &ms_client, NULL, 0);
++				printf("PANDORA MODEM: channel IPCRTR waits%s\n", ms_ch ? "" : ": failed");
++			}
++		}
+ 		for (unsigned i = 0; i < AD_EDGES; i++) {
+ 			p2p_service(ad_edges[i]);
+ 			gl_service(ad_edges[i]);
+@@ -3191,6 +3208,27 @@
+ 
+ int pandora_part_file(const char *name, void *dst, uint64_t max, uint64_t *size);
+ int pandora_smmu_pass(uint16_t id, uint16_t mask);
++
++int pandora_smmu_report(const char *when);
++
++/* The apps SMMU's global fault state, cleared after the look: t10's sound went when the chip's first DMA failed. */
++int
++pandora_smmu_report(const char *when)
++{
++	vm_offset_t s = ad_map(0x15000000u, 0x1000u, VM_WIMG_IO);
++	if (!s) {
++		return ENOMEM;
++	}
++	const uint32_t g = *(volatile uint32_t *)(s + 0x48), y0 = *(volatile uint32_t *)(s + 0x50),
++	    y1 = *(volatile uint32_t *)(s + 0x54), y2 = *(volatile uint32_t *)(s + 0x58);
++	printf("PANDORA SMMU: %s: sGFSR %08x sGFSYNR0 %08x sGFSYNR1 %08x (stream %#x) sGFSYNR2 %08x\n", when, g, y0, y1, y1 & 0xffff, y2);
++	if (g) {
++		*(volatile uint32_t *)(s + 0x48) = g;
++		__asm__ volatile ("dsb sy" ::: "memory");
++	}
++	ml_io_unmap(s, 0x1000u);
++	return 0;
++}
+ 
+ /* A file of /image in the firmware partition (Android's /vendor/firmware_mnt), read only. */
+ int
+@@ -3263,6 +3301,53 @@
+  * the DSM partitions (memory-region 3 and 4) assigned to the modem's VM. Boot-arg pandora_mss=1. No rmtfs here: the
+  * modem cannot reach its EFS partitions, it only asks the apps for them. This step says how far it gets alone.
+  */
++/* 0349: IPCRTR on the modem's link, read only so far: who it serves and whom it asks for. qrtr_hdr_v1 in af_qrtr.c. */
++static unsigned ms_rx_shown;
++
++static void
++ms_qrtr_send_hello(QcomGlinkChannel *ch)
++{
++	static const uint32_t pkt[10] = {1, 2, 1, 0xfffffffeu, 0, 8, 0, 0xfffffffeu, 2, 0};    /* HELLO from node 1 */
++	int e = qcom_glink_send(&ed_modem.gl, ch, pkt, sizeof(pkt));
++	printf("PANDORA MODEM: QRTR HELLO sent -> %d\n", e);
++}
++
++static void
++ms_state(void *ctx, QcomGlinkChannel *ch, int up)
++{
++	(void)ctx;
++	printf("PANDORA MODEM: IPCRTR %s\n", up ? "up" : "down");
++	if (up) {
++		ms_qrtr_send_hello(ch);
++	}
++}
++
++static void
++ms_receive(void *ctx, QcomGlinkChannel *ch, const uint8_t *d, uint32_t len)
++{
++	(void)ctx;
++	if (len < 32 || ms_rx_shown >= 200) {
++		return;
++	}
++	ms_rx_shown++;
++	uint32_t w[12] = {0};
++	memcpy(w, d, MIN(len, sizeof(w)));
++	static const char *const names[12] = {"?", "DATA", "HELLO", "BYE", "NEW_SERVER", "DEL_SERVER", "DEL_CLIENT", "RESUME_TX",
++	    "EXIT", "PING", "NEW_LOOKUP", "DEL_LOOKUP"};
++	const uint32_t t = w[1];
++	if (w[0] == 1 && t == 4 && len >= 48) {
++		printf("PANDORA MODEM: QRTR NEW_SERVER service %u instance %#x node %u port %u\n", w[9], w[10], w[11], len >= 52 ? d[48] : 0);
++	} else if (w[0] == 1 && t == 10) {
++		printf("PANDORA MODEM: QRTR NEW_LOOKUP (asks for) service %u instance %#x\n", w[9], w[10]);
++	} else {
++		printf("PANDORA MODEM: QRTR v%u %s from %u:%u to %u:%u, %u bytes, words %08x %08x %08x\n", w[0], t < 12 ? names[t] : "?", w[2], w[3], w[6], w[7],
++		    w[5], w[8], w[9], w[10]);
++	}
++	if (w[0] == 1 && t == 2) {
++		ms_qrtr_send_hello(ch);
++	}
++}
++
+ #define MS_LOW_PA    0xe0600000ull      /* System RAM of the low bank under Android, nothing of XNU's: metadata */
+ #define MS_TABLE_PA  0xe0700000ull      /* the tables of the assign call */
+ 
+@@ -3373,8 +3458,7 @@
+ 		printf("PANDORA MODEM: not ready after 30 s, slave-kernel %#x\n", e->slave);
+ 		return;
+ 	}
+-	err = gl_start(e, false);
+-	printf("PANDORA MODEM: GLINK start -> %d\n", err);
++	ms_gl_wanted = true;             /* gl_start and the channel from the thread that owns the links */
+ 	/* What it does next, with nobody serving its files: the links' reports show its channels. */
+ 	for (unsigned t = 0; t < 12; t++) {
+ 		ad_sleep(10000);
+--- a/bsd/dev/pandora_wlan.c	2026-11-04 19:09:13
++++ b/bsd/dev/pandora_wlan.c	2026-11-04 19:09:28
+@@ -33,6 +33,7 @@
+ extern int pandora_rpmh_clk(const char *res);
+ extern int pandora_part_file(const char *name, void *dst, uint64_t max, uint64_t *size);
+ extern int pandora_smmu_pass(uint16_t id, uint16_t mask);
++extern int pandora_smmu_report(const char *when);
+ 
+ #define WL_GCC_PA    0x00100000ull
+ #define WL_TLMM_PA   0x0f100000ull
+@@ -307,6 +308,26 @@
+ 		return ENOMEM;
+ 	}
+ 
++	/* 0349: msm_pcie_config_sid: requester ids to SMMU streams, DT iommu-map <0 0x1400>, <0x100 0x1401>. t10: bypass left on,
++	 * the chip's first DMA failed (BHI status 3) and the sound went at that moment. CRC8 MSB, polynomial 7, of the id
++	 * big endian; bdf 0 has hash 0 and value 0, so one entry. */
++	{
++		uint8_t crc = 0;
++		static const uint8_t be[2] = {0x01, 0x00};
++		for (unsigned b = 0; b < 2; b++) {
++			crc ^= be[b];
++			for (unsigned n = 0; n < 8; n++) {
++				crc = (crc & 0x80) ? (uint8_t)((crc << 1) ^ 0x07) : (uint8_t)(crc << 1);
++			}
++		}
++		clr(parf, 0x2c00, 1u);
++		for (unsigned h = 0; h < 256; h++) {
++			wr(parf, 0x2000 + 4 * h, 0);
++		}
++		wr(parf, 0x2000 + 4u * crc, (0x100u << 16) | (1u << 8));
++		printf("PANDORA WLAN: BDF to SID: config %#x, 1:0.0 at hash %#x reads %#x\n", rd(parf, 0x2c00), crc, rd(parf, 0x2000 + 4u * crc));
++	}
++
+ 	/* msm_pcie_enable_link */
+ 	wr(parf, 0x1000, 4);                    /* root complex */
+ 	clr(parf, 0x20, 1u << 5);               /* PM_CTRL: L1 allowed */
+@@ -482,22 +503,26 @@
+ #define WF_NER   2u
+ #define WF_ELS   256u
+ 
++/* 0349: below 4 GiB like Android's IOVAs (0xa0000000 on), non cached: low-bank RAM XNU does not use (Android's System RAM). */
++#define WF_LOW_FW   0xe1000000ull
++#define WF_LOW_CTX  0xe1800000ull
++
+ static vm_offset_t
+-wf_alloc(vm_size_t size, uint64_t *pa)
++wf_low(uint64_t pa, vm_size_t size)
+ {
+-	vm_offset_t va = 0;
+-	if (kmem_alloc_contig(kernel_map, &va, size, PAGE_MASK, 0, 0,
+-	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+-		return 0;
++	vm_offset_t va = ml_io_map_unmappable((vm_offset_t)pa, size, VM_WIMG_WCOMB);
++	if (va) {
++		bzero((void *)va, size);
+ 	}
+-	*pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)va));
+ 	return va;
+ }
+ 
+ static inline void
+ wf_flush(uint64_t pa, uint64_t len)
+ {
+-	flush_dcache64((addr64_t)pa, (unsigned)len, TRUE);
++	(void)pa;
++	(void)len;
++	__asm__ volatile ("dsb sy" ::: "memory");
+ }
+ 
+ static void
+@@ -511,19 +536,21 @@
+ wf_boot(vm_offset_t mhi, uint32_t bhi)
+ {
+ 	const uint32_t bhie = rd(mhi, 0x2c), chdb = rd(mhi, 0x18), erdb = rd(mhi, 0x20);
+-	uint64_t fw_pa = 0, size = 0, ctx_pa = 0;
++	const uint64_t fw_pa = WF_LOW_FW, ctx_pa = WF_LOW_CTX;
++	uint64_t size = 0;
+ 	int e = pandora_smmu_pass(0x1400, 0x7f);
+ 	printf("PANDORA WLAN: SMMU -> %d; BDF to SID config %#x\n", e, rd(parf, 0x2c00));
+ 	if (e) {
+ 		return e;
+ 	}
+ 	set(dbi, WL_CFG_OFF + 0x04, 6u);        /* memory, bus master */
+-	const vm_offset_t fw = wf_alloc(WF_MAX, &fw_pa);
++	const vm_offset_t fw = wf_low(fw_pa, WF_MAX);
+ 	/* One block: contexts, rings, vector table. */
+-	const vm_offset_t ctx = wf_alloc(0x40000, &ctx_pa);
++	const vm_offset_t ctx = wf_low(ctx_pa, 0x40000);
+ 	if (!fw || !ctx) {
+ 		return ENOMEM;
+ 	}
++	(void)pandora_smmu_report("before the firmware");
+ 	e = pandora_part_file("peach/amss20.bin", (void *)fw, WF_MAX, &size);
+ 	printf("PANDORA WLAN: amss20.bin -> %d, %llu bytes at %#llx\n", e, size, fw_pa);
+ 	if (e) {
+@@ -562,6 +589,7 @@
+ 	}
+ 	printf("PANDORA WLAN: BHI image: status %u after %u0 ms\n", st, i);
+ 	wf_state(mhi, bhi, "after BHI");
++	(void)pandora_smmu_report("after BHI");
+ 	if (st != 2) {
+ 		return EIO;
+ 	}
+@@ -655,6 +683,7 @@
+ 		}
+ 	}
+ 	wf_state(mhi, bhi, "at the end");
++	(void)pandora_smmu_report("at the end");
+ 	return ee == 2 ? 0 : EIO;
+ }
+ 

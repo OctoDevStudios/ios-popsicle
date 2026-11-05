@@ -1,0 +1,117 @@
+xnu 0365: the Mac orders the restart over the USB console (mac/live.py), when the log has the answer
+
+--- a/bsd/dev/pandora_usb.c
++++ b/bsd/dev/pandora_usb.c
+@@ -37,6 +37,9 @@
+ #include <kern/processor.h>
+ #include "qcomusb/include/QcomXnuUsbDebug.h"
+ 
++void pandora_log_reboot_now(void);
++void pandora_reset_now(void);
++
+ extern kern_return_t thread_terminate(thread_t);
+ extern uint32_t sweet_log_copy(uint64_t *pos, char *out, uint32_t max);
+ extern uint32_t sweet_log_copy_any(uint64_t *pos, char *out, uint32_t max);   /* 0258: unfinished bytes too */
+@@ -173,7 +176,23 @@
+ 		return;
+ 	}
+ 	__atomic_store_n(&pu_up, 1u, __ATOMIC_RELEASE);
++	/* the Mac can order a restart over this link (mac/live.py), when the log has answered the test's question */
++	const int ctl = qcom_usb_debug_control_start();
++	if (ctl) {
++		qcom_usb_debug_control_external_reset();
++	}
++	printf("PANDORA USB: control %d\n", ctl);
++	unsigned reboot_at = 0;
+ 	for (unsigned n = 1;; n++) {
++		if (ctl && !reboot_at && qcom_usb_debug_control_take_reboot()) {
++			printf("PANDORA USB: restart ordered by the Mac\n");
++			pandora_log_reboot_now();
++			reboot_at = n + 600;    /* 3 s for the log thread's clean restart */
++		}
++		if (reboot_at && n == reboot_at) {
++			printf("PANDORA USB: the log thread did not restart, resetting\n");
++			pandora_reset_now();
++		}
+ 		uint32_t idle = PU_IDLE;
+ 		if (!__atomic_compare_exchange_n(&pu_state, &idle, PU_THREAD, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+ 			for (;;) {    /* pandora_usb_final took over; the reset follows */
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -1991,6 +1991,7 @@
+ static bool pl_ready;
+ static uint64_t pl_flushed, pl_seq;
+ static int pl_chan;
++static _Atomic uint32_t pl_reboot_now;
+ 
+ #if defined(PANDORA)
+ extern void pandora_usb_final(void);
+@@ -2216,8 +2217,8 @@
+ 			pl_ready = false;
+ 			return;
+ 		}
+-		if (limit && mach_absolute_time() - start >= limit) {
+-			printf("PANDORA: pandora_reboot_after=%u reached, resetting\n", reboot_after);
++		if ((limit && mach_absolute_time() - start >= limit) || os_atomic_load(&pl_reboot_now, acquire)) {
++			printf("PANDORA: pandora_reboot_after=%u or an order from the Mac, resetting\n", reboot_after);
+ 			pandora_amp_final("pandora_reboot_after");      /* 0298: the speaker amps down first */
+ 			lck_mtx_lock(&sweet_ufs_lock);
+ 			(void)pl_flush();
+@@ -2227,6 +2228,22 @@
+ 	}
+ }
+ 
++/* An order from the Mac over USB (pandora_usb.c): the same clean restart as pandora_reboot_after, now. */
++void pandora_log_reboot_now(void);
++void
++pandora_log_reboot_now(void)
++{
++	os_atomic_store(&pl_reboot_now, 1u, release);
++	wakeup(&pl_chan);
++}
++
++void pandora_reset_now(void);
++void
++pandora_reset_now(void)
++{
++	pl_psci_reset();
++}
++
+ /* 0217: write the ring to the log file now (thread context; false when there is no log file). */
+ bool pandora_log_sync(void);
+ bool
+--- a/bsd/dev/qcomusb/kernel/QcomXnuUsbDebug.c
++++ b/bsd/dev/qcomusb/kernel/QcomXnuUsbDebug.c
+@@ -1320,6 +1320,11 @@
+     __atomic_store_n(&control_started, 2u, __ATOMIC_RELEASE);
+     return 1;
+ }
++/* popsicle: no PSCI hook here, the caller of take_reboot does the reset itself (pandora_usb.c). */
++void qcom_usb_debug_control_external_reset(void)
++{
++    __atomic_store_n(&control_hook_owned, 1u, __ATOMIC_RELEASE);
++}
+ int qcom_usb_debug_control_take_reboot(void)
+ {
+     unsigned int expected = 0;
+--- a/bsd/dev/qcomusb/include/QcomXnuUsbDebug.h
++++ b/bsd/dev/qcomusb/include/QcomXnuUsbDebug.h
+@@ -119,6 +119,7 @@
+  * restart callback once, only when PE_halt_restart is NULL. No command runs. */
+ int qcom_usb_debug_control_start(void);
+ /* One-shot handoff from the USB worker to a dedicated normal reboot thread. */
++void qcom_usb_debug_control_external_reset(void);
+ int qcom_usb_debug_control_take_reboot(void);
+ /* Consume the final restart request only after the ACK and TX backlog drained. */
+ int qcom_usb_debug_control_arm_reboot(void);
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -193,7 +193,7 @@
+ #endif /* __has_feature(ptrauth_calls) */
+ 
+ #if DEBUG || DEVELOPMENT
+-static TUNABLE(bool, unentitled_ios_sim_launch, "unentitled_ios_sim_launch", false);
++static TUNABLE(bool, unentitled_ios_sim_launch, "unentitled_ios_sim_launch", true);    /* popsicle: every iOS binary needs it; boot-args are short of room */
+ #endif /* DEBUG || DEVELOPMENT */
+ #endif /* XNU_TARGET_OS_OSX */
+ 

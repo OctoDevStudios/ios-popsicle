@@ -1,0 +1,25 @@
+diff --git a/bsd/dev/pandora_gpu.c b/bsd/dev/pandora_gpu.c
+--- a/bsd/dev/pandora_gpu.c
++++ b/bsd/dev/pandora_gpu.c
+@@ -3887,6 +3887,21 @@
+ 			idle_since = t;
+ 		}
+ 		want = MAX(want, floor);
++		/* popsicle: boot-arg pandora_gpu_min_mhz=N, a floor while work came in the last DCVS_IDLE_NS: frames no longer
++		 * start from 222 MHz (post28: "frames wait for the GPU"). The caps below stay over it. */
++		static uint32_t min_mhz = ~0u;
++		if (min_mhz == ~0u) {
++			min_mhz = 0;
++			(void)PE_parse_boot_argn("pandora_gpu_min_mhz", &min_mhz, sizeof(min_mhz));
++			printf("PANDORA GPU DCVS: floor %u MHz while active\n", min_mhz);
++		}
++		if (min_mhz != 0 && min_mhz <= 1200) {
++			uint64_t quiet;
++			absolutetime_to_nanoseconds(t - idle_since, &quiet);
++			if (quiet < DCVS_IDLE_NS) {
++				want = MAX(want, gpu_level_for(min_mhz * 1000000u, top));
++			}
++		}
+ 		const uint32_t tcap = __atomic_load_n(&pandora_gpu_thermal_top, __ATOMIC_RELAXED);
+ 		if (tcap != 0 && want > tcap) {
+ 			want = tcap;    /* 0213: temperature cap, over every other reason */

@@ -1,0 +1,693 @@
+diff --git a/bsd/dev/pandora_adsp.c b/bsd/dev/pandora_adsp.c
+--- a/bsd/dev/pandora_adsp.c
++++ b/bsd/dev/pandora_adsp.c
+@@ -359,8 +359,11 @@
+ 	return ENOENT;
+ }
+ 
++LCK_GRP_DECLARE(ad_rpmh_grp, "pandora_rpmh");
++LCK_MTX_DECLARE(ad_rpmh_lock, &ad_rpmh_grp);
++
+ static int
+-rpmh_write1(uint32_t addr, uint32_t data)
++rpmh_write1_locked(uint32_t addr, uint32_t data)
+ {
+ 	const uint32_t tcs = 0xd00, stride = 0x2a0;
+ 	int chosen = -1;
+@@ -400,6 +403,39 @@
+ 	ad_wr(ad_rsc, tcs + 8, bit);
+ 	ad_wr(ad_rsc, tcs + 0, irq_en);
+ 	return done ? 0 : ETIMEDOUT;
++}
++
++static int
++rpmh_write1(uint32_t addr, uint32_t data)
++{
++	lck_mtx_lock(&ad_rpmh_lock);
++	int e = rpmh_write1_locked(addr, data);
++	lck_mtx_unlock(&ad_rpmh_lock);
++	return e;
++}
++
++/* One VRM (rpmh-regulator order: voltage, mode, enable) for bsd/dev/pandora_wlan.c. mode < 0 leaves it alone. */
++int pandora_rpmh_vrm(const char *res, uint32_t mv, int mode);
++
++int
++pandora_rpmh_vrm(const char *res, uint32_t mv, int mode)
++{
++	uint32_t addr, aux, len;
++	if (!ad_rsc) {
++		ad_rsc = ad_map(AD_RSC_PA, 0x10000, VM_WIMG_IO);
++	}
++	if (!ad_db) {
++		ad_db = ad_map(AD_CMDDB_PA, AD_CMDDB_SIZE, VM_WIMG_IO);
++	}
++	int e = cmddb_find(res, &addr, &aux, &len);
++	if (e) {
++		return e;
++	}
++	e = rpmh_write1(addr, mv);
++	if (!e && mode >= 0) {
++		e = rpmh_write1(addr + 8, (uint32_t)mode);
++	}
++	return e ? e : rpmh_write1(addr + 4, 1);
+ }
+ 
+ /* ARC: the vote is the index of the first level in the aux table at or above vlvl. */
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -63,6 +63,7 @@
+ extern void pandora_amp_init(void);
+ extern void pandora_selftest_init(void);
+ extern void pandora_adsp_init(void);
++extern void pandora_wlan_init(void);
+ extern void pandora_files_init(void);
+ extern void pandora_gpu_init(void);
+ extern void pandora_cpu_init(void);
+@@ -1574,6 +1575,8 @@
+ 	pandora_selftest_init();
+ 	/* Audio DSP bring-up, boot-arg pandora_adsp (bsd/dev/pandora_adsp.c). */
+ 	pandora_adsp_init();
++	/* Wi-Fi PCIe bring-up, boot-arg pandora_wlan (bsd/dev/pandora_wlan.c). */
++	pandora_wlan_init();
+ 	/* Files from the pinned pack into the root file system (bsd/dev/pandora_files.c). */
+ 	pandora_files_init();
+ 	/* Adreno 840 bring-up, boot-arg pandora_gpu (bsd/dev/pandora_gpu.c). */
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -124,6 +124,7 @@
+ bsd/dev/qcomusb/soc/QcomUsbPrepare.c		standard
+ bsd/dev/pandora_selftest.c		standard
+ bsd/dev/pandora_adsp.c			standard
++bsd/dev/pandora_wlan.c			standard
+ bsd/dev/qcom/QcomSmem.c			standard
+ bsd/dev/qcom/QcomSmp2p.c		standard
+ bsd/dev/qcom/QcomGlink.c		standard
+diff --git a/bsd/dev/pandora_wlan.c b/bsd/dev/pandora_wlan.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/pandora_wlan.c
+@@ -0,0 +1,393 @@
++/*
++ * Wi-Fi on the Xiaomi 17 Pro Max (popsicle), first step: bring up PCIe RC0 and read the WCN7880's
++ * config space. Boot-arg pandora_wlan=1; off by default, nothing here runs without it.
++ *
++ * SM8850 differs from the SM8550 of bsd/dev/wlan.c: the PCIe clocks and core GDSC belong to CESTA.
++ * The device tree gives the node no clocks, and Android's clk_summary shows the gcc_pcie_0 clocks at
++ * enable count 0 with the link up. So we follow pci-msm.c's CESTA path: load the PCIe state manager,
++ * vote the perf level through HW DRV 0 of pcie_crm (crm-v2.c, pcie_crm_desc_v3), and only then touch
++ * the controller, once the CRM reports that level and the clocks read as running. Without them PARF
++ * would answer with an SError, so each gate that fails stops here with a log line.
++ *
++ * Rail voltages are the device tree's qcom,vdd-wlan-*-config minimum values, the ones Android reads
++ * at runtime in its regulator summary.
++ */
++#if defined(PANDORA)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <vm/pmap.h>
++#include "pandora_wlan_tables.h"
++
++extern kern_return_t thread_terminate(thread_t);
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);
++extern int pandora_rpmh_vrm(const char *res, uint32_t mv, int mode);
++
++#define WL_GCC_PA    0x00100000ull
++#define WL_TLMM_PA   0x0f100000ull
++#define WL_PARF_PA   0x01c00000ull
++#define WL_PHY_PA    0x01c06000ull
++#define WL_CRM_PA    0x01d01000ull      /* base */
++#define WL_CRMC_PA   0x01d03800ull      /* crm_c */
++#define WL_SM_PA     0x01d07000ull
++#define WL_DBI_PA    0x400000000ull
++#define WL_ELBI_OFF  0xf20u
++#define WL_ATU_PA    0x410000000ull
++#define WL_CFG_OFF   0x100000u          /* endpoint config, through iATU region 0 */
++
++#define GPIO_WLAN_EN 16u
++#define GPIO_PERST   102u
++#define GPIO_CLKREQ  103u
++#define GPIO_WAKE    104u
++
++#define PERF_LVL_GEN3 4u                /* PERF_LVL_GEN1 is 2 in msm_pcie_cesta_perf_idx */
++#define WLAN_ID      0x110e17cbu
++
++static vm_offset_t gcc, parf, phy, crm, crmc, sm, dbi, atu;
++static int wl_chan;
++
++static inline uint32_t rd(vm_offset_t b, uint32_t o) { return *(volatile uint32_t *)(b + o); }
++static inline void wr(vm_offset_t b, uint32_t o, uint32_t v)
++{
++	*(volatile uint32_t *)(b + o) = v;
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++static inline void set(vm_offset_t b, uint32_t o, uint32_t bits) { wr(b, o, rd(b, o) | bits); }
++static inline void clr(vm_offset_t b, uint32_t o, uint32_t bits) { wr(b, o, rd(b, o) & ~bits); }
++
++static vm_offset_t
++wl_map(uint64_t pa, uint64_t len)
++{
++	return ml_io_map_unmappable((vm_offset_t)pa, (vm_size_t)((len + 0xfff) & ~0xfffull), VM_WIMG_IO);
++}
++
++static void
++wl_sleep(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&wl_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++/* One TLMM pin: control, then the output level if it drives. */
++static void
++wl_gpio(unsigned pin, uint32_t ctl, int level)
++{
++	vm_offset_t t = wl_map(WL_TLMM_PA + pin * 0x1000ull, 0x1000);
++	if (level >= 0) {
++		wr(t, 4, level ? 2u : 0u);
++	}
++	wr(t, 0, ctl);
++	printf("PANDORA WLAN: GPIO %u control %#x (reads %#x) io %#x\n", pin, ctl, rd(t, 0), rd(t, 4));
++}
++
++/* The WCN rails in the device tree's order for the node (properties are stored last first). */
++static int
++wl_rails(void)
++{
++	static const struct {
++		const char *res;
++		uint32_t mv;
++		int mode;       /* 7: LDO high power, for what Android gives a load; -1: left alone */
++	} rails[] = {
++		{"L2G_E0", 1800, 7},
++		{"L3G_E0", 1200, 7},
++		{"S1J_E1", 892, -1},
++		{"S2J_E1", 892, -1},
++		{"S8F_E0", 1800, -1},
++		{"S7F_E0", 1224, -1},
++		{"L3K_E1", 1200, 7},
++	};
++	for (unsigned i = 0; i < sizeof(rails) / sizeof(rails[0]); i++) {
++		int e = pandora_rpmh_vrm(rails[i].res, rails[i].mv, rails[i].mode);
++		printf("PANDORA WLAN: rail %s %u mV -> %d\n", rails[i].res, rails[i].mv, e);
++		if (e) {
++			return e;
++		}
++		wl_sleep(2);
++	}
++	return 0;
++}
++
++/* pci-msm.c msm_pcie_cesta_load_sm_seq, with pcie_sm_regs=0x1D07000,0x1040,0x1048,0x3000,1 from Android's command line. */
++static void
++wl_sm_load(void)
++{
++	wr(sm, 0x1040, 0);
++	wr(sm, 0x1048, 0);
++	for (unsigned i = 0; i < sizeof(wl_sm_seq) / sizeof(wl_sm_seq[0]); i++) {
++		wr(sm, 4 * i, wl_sm_seq[i]);
++	}
++	for (unsigned i = 0; i < sizeof(wl_sm_branch) / sizeof(wl_sm_branch[0]); i++) {
++		wr(sm, 0x1000 + 4 * i, wl_sm_branch[i]);
++	}
++	set(sm, 0x1090, 1);
++}
++
++/* crm_write_perf_ol + crm_write_pwr_states for HW DRV 0: the free channel's power state votes, then switch to it. */
++static int
++wl_crm_vote(uint32_t perf)
++{
++	const uint32_t cfg = rd(crm, 4);
++	const uint32_t vcds = (cfg >> 6) & 0xf, states = cfg & 0xf;
++	const uint32_t update = rd(crm, 0x374);
++	const uint32_t ch = (update & 1) ? 1 : 0;
++	printf("PANDORA WLAN: CRM version %#x cfg %#x: %u VCDs, %u power states; channel update %#x, voting on %u\n",
++	    rd(crm, 0), cfg, vcds, states, update, ch);
++	if (vcds == 0 || vcds > 8 || states < 2 || states > 5) {
++		return EINVAL;
++	}
++	for (uint32_t r = 0; r < vcds; r++) {
++		for (uint32_t st = 0; st < states; st++) {
++			wr(crm, st * 4 + ch * 0x14 + r * 0x2c, (r == 0 && st < 2) ? perf : 0);
++		}
++	}
++	wr(crm, 0x374, 1u << ch);
++	for (unsigned i = 0; i < 100; i++) {
++		if ((rd(crm, 0x370) & 3u) == (1u << ch)) {
++			return 0;
++		}
++		delay(100);
++	}
++	printf("PANDORA WLAN: CRM channel %u did not take over, busy %#x\n", ch, rd(crm, 0x370));
++	return ETIMEDOUT;
++}
++
++static void
++wl_bcr(uint32_t off, bool assert)
++{
++	if (assert) {
++		set(gcc, off, 1);
++	} else {
++		clr(gcc, off, 1);
++	}
++}
++
++/* The Gen3 preset hint in the Secondary PCIe extended capability, as msm_pcie_config_core_preset. */
++static void
++wl_preset(void)
++{
++	uint32_t o = 0x100;
++	for (unsigned n = 0; o >= 0x100 && o < 0x1000 && n < 32; n++) {
++		uint32_t h = rd(dbi, o);
++		if ((h & 0xffff) == 0x19) {
++			wr(dbi, o + 0xc, 0x55555555u);
++			printf("PANDORA WLAN: Gen3 preset at %#x\n", o + 0xc);
++			return;
++		}
++		o = h >> 20;
++	}
++}
++
++static int
++wl_bringup(void)
++{
++	gcc = wl_map(WL_GCC_PA, 0x80000);
++	crm = wl_map(WL_CRM_PA, 0x2000);
++	crmc = wl_map(WL_CRMC_PA, 0x2000);
++	sm = wl_map(WL_SM_PA, 0x7000);
++	if (!gcc || !crm || !crmc || !sm) {
++		return ENOMEM;
++	}
++
++	/* PERST held, CLKREQ and WAKE in their DT modes, before anything has power. */
++	wl_gpio(GPIO_PERST, 0x200u | 1u, 0);
++	wl_gpio(GPIO_CLKREQ, (1u << 2) | 3u, -1);
++	wl_gpio(GPIO_WAKE, 3u, -1);
++
++	int e = wl_rails();
++	if (e) {
++		return e;
++	}
++	wl_sleep(5);
++	wl_gpio(GPIO_WLAN_EN, 0x200u | (7u << 6) | 3u, 1);
++	wl_sleep(100);
++
++	/* gcc-canoe.c keeps these two on at probe: gcc_pcie_rscc_cfg_ahb_clk, gcc_pcie_rscc_xo_clk. */
++	set(gcc, 0x52010, (1u << 20) | (1u << 21));
++	delay(10);
++	printf("PANDORA WLAN: before: core GDSC %#x phy GDSC %#x vote %#x cfg_ahb %#x pipe %#x aux %#x\n",
++	    rd(gcc, 0x6b004), rd(gcc, 0x6c000), rd(gcc, 0x5214c), rd(gcc, 0x6b040), rd(gcc, 0x6b064), rd(gcc, 0x6b044));
++
++	/* The phy GDSC stays with software on Android (genpd "on", active); the core GDSC is CESTA's. */
++	clr(gcc, 0x5214c, 1u << 2);
++	unsigned i;
++	for (i = 0; i < 1500; i++) {
++		if (rd(gcc, 0x6c004) & (1u << 16)) {
++			break;
++		}
++		delay(1);
++	}
++	printf("PANDORA WLAN: phy GDSC after %u us: %#x cfg %#x\n", i, rd(gcc, 0x6c000), rd(gcc, 0x6c004));
++
++	wl_sm_load();
++	e = wl_crm_vote(PERF_LVL_GEN3);
++	if (e) {
++		return e;
++	}
++	uint32_t cur = 0;
++	for (i = 0; i < 200; i++) {
++		cur = rd(crmc, 0x24) & 7u;
++		if (cur == PERF_LVL_GEN3) {
++			break;
++		}
++		wl_sleep(1);
++	}
++	uint32_t ahb = rd(gcc, 0x6b040), core = rd(gcc, 0x6b004);
++	printf("PANDORA WLAN: CRM perf level %u after %u ms (wanted %u): core GDSC %#x cfg_ahb %#x mstr %#x slv %#x\n",
++	    cur, i, PERF_LVL_GEN3, core, ahb, rd(gcc, 0x6b030), rd(gcc, 0x6b020));
++	for (unsigned k = 0; k < 14; k++) {
++		printf("PANDORA WLAN: SM debug %#x = %#x\n", 0x1040 + 8 * k, rd(sm, 0x1040 + 8 * k));
++	}
++	/* CLK_OFF is bit 31. An unclocked controller would stop the phone with an SError. */
++	if (cur != PERF_LVL_GEN3 || (ahb & 0x80000000u)) {
++		printf("PANDORA WLAN: the controller has no clock: stopping before PARF\n");
++		return ENXIO;
++	}
++
++	wl_bcr(0x6b000, true);
++	wl_bcr(0x6c01c, true);
++	delay(1000);
++	wl_bcr(0x6c01c, false);
++	wl_bcr(0x6b000, false);
++	delay(1000);
++	printf("PANDORA WLAN: controller out of reset\n");
++
++	parf = wl_map(WL_PARF_PA, 0x3000);
++	phy = wl_map(WL_PHY_PA, 0x2000);
++	dbi = wl_map(WL_DBI_PA, 2 * WL_CFG_OFF);
++	atu = wl_map(WL_ATU_PA, 0x1000);
++	if (!parf || !phy || !dbi || !atu) {
++		return ENOMEM;
++	}
++
++	/* msm_pcie_enable_link */
++	wr(parf, 0x1000, 4);                    /* root complex */
++	clr(parf, 0x20, 1u << 5);               /* PM_CTRL: L1 allowed */
++	clr(parf, 0x40, 1u);                    /* PHY_CTRL */
++	wr(parf, 0x00, 0x365e);                 /* SYS_CTRL */
++	set(parf, 0x174, 1u << 4);              /* MHI clock reset control */
++	wr(parf, 0x22c, 0);                     /* no interrupts: this step polls */
++	wr(parf, 0x350, (uint32_t)WL_DBI_PA);
++	wr(parf, 0x354, (uint32_t)(WL_DBI_PA >> 32));
++	wr(parf, 0x634, (uint32_t)WL_ATU_PA);
++	wr(parf, 0x638, (uint32_t)(WL_ATU_PA >> 32));
++	wr(parf, 0x358, 0);
++	wr(parf, 0x35c, 0x80000000u);
++	set(parf, 0x1a8, 1u << 31);             /* AXI master write address halt */
++	clr(parf, 0x4a0, 1u);                   /* BDF change halt */
++
++	for (i = 0; i < sizeof(wl_phy_seq) / sizeof(wl_phy_seq[0]); i++) {
++		wr(phy, wl_phy_seq[i][0], wl_phy_seq[i][1]);
++		if (wl_phy_seq[i][2]) {
++			delay(wl_phy_seq[i][2]);
++		}
++	}
++	delay(1000);
++	for (i = 0; i < 100; i++) {
++		if (!(rd(phy, 0x414) & (1u << 7))) {
++			break;
++		}
++		wl_sleep(1);
++	}
++	printf("PANDORA WLAN: PHY status %#x after %u ms; power down control %#x\n", rd(phy, 0x414), i, rd(phy, 0x440));
++	if (rd(phy, 0x414) & (1u << 7)) {
++		printf("PANDORA WLAN: the PHY did not come up: stopping\n");
++		return EIO;
++	}
++	wl_sleep(10);                           /* qcom,ep-latency */
++
++	printf("PANDORA WLAN: root port %#x link caps %#x\n", rd(dbi, 0), rd(dbi, 0x70 + 0x0c));
++	set(dbi, 0x8bc, 1u);                    /* read only registers writable */
++	wr(dbi, 0x08, (rd(dbi, 0x08) & 0xffu) | (0x060400u << 8));
++	wl_preset();
++	clr(dbi, 0x8bc, 1u);
++	clr(parf, 0x2c4, 1u);
++	set(parf, 0x2c4, 1u << 8);
++	set(dbi, 0x714, 1u << 5);
++
++	wl_gpio(GPIO_PERST, 0x200u | 1u, 1);    /* out of reset */
++	wl_sleep(5);
++
++	wr(dbi, 0x80c, (rd(dbi, 0x80c) & ~0x1f00u) | (1u << 8));
++	wr(dbi, 0x70 + 0x30, (rd(dbi, 0x70 + 0x30) & ~0xfu) | 3u);      /* qcom,target-link-speed */
++	set(parf, 0x1b0, 1u << 8);              /* LTSSM on */
++
++	uint64_t seen = 0;
++	uint32_t st = 0, lnk = 0;
++	for (i = 0; i < 1000; i++) {
++		st = rd(dbi, WL_ELBI_OFF + 8);
++		lnk = rd(dbi, 0x70 + 0x10);
++		seen |= 1ull << ((st >> 12) & 0x3f);
++		if ((st & 0x400u) && (lnk & (1u << 29))) {
++			break;
++		}
++		wl_sleep(1);
++	}
++	printf("PANDORA WLAN: after %u ms ELBI status %#x (LTSSM %u) link %#x, states seen %#llx\n",
++	    i, st, (st >> 12) & 0x3f, lnk, seen);
++	if (!(st & 0x400u) || !(lnk & (1u << 29))) {
++		printf("PANDORA WLAN: no link\n");
++		return ETIMEDOUT;
++	}
++	printf("PANDORA WLAN: LINK UP: Gen%u x%u\n", (lnk >> 16) & 0xf, (lnk >> 20) & 0x3f);
++
++	wl_sleep(100);
++	wr(dbi, 0x18, (rd(dbi, 0x18) & 0xff000000u) | 0x00ff0100u);     /* primary 0, secondary 1, subordinate 255 */
++	wr(atu, 0x04, 0);
++	wr(atu, 0x00, 4);                       /* CFG0 */
++	wr(atu, 0x08, (uint32_t)(WL_DBI_PA + WL_CFG_OFF));
++	wr(atu, 0x0c, (uint32_t)((WL_DBI_PA + WL_CFG_OFF) >> 32));
++	wr(atu, 0x10, (uint32_t)(WL_DBI_PA + WL_CFG_OFF + 0xfffff));
++	wr(atu, 0x14, 1u << 24);                /* bus 1, device 0, function 0 */
++	wr(atu, 0x18, 0);
++	wr(atu, 0x04, 1u << 31);
++	delay(100);
++	uint32_t id = 0;
++	for (i = 0; i < 100; i++) {
++		id = rd(dbi, WL_CFG_OFF);
++		if (id != 0xffffffffu && id != 0xffff0001u && id != 0) {
++			break;
++		}
++		wl_sleep(10);
++	}
++	printf("PANDORA WLAN: endpoint id %#x after %u tries (wanted %#x); class %#x, subsystem %#x\n",
++	    id, i, WLAN_ID, rd(dbi, WL_CFG_OFF + 8), rd(dbi, WL_CFG_OFF + 0x2c));
++	for (i = 0; i < 6; i++) {
++		printf("PANDORA WLAN: BAR%u %#x\n", i, rd(dbi, WL_CFG_OFF + 0x10 + 4 * i));
++	}
++	return id == WLAN_ID ? 0 : EIO;
++}
++
++static void
++wl_thread(void *arg, wait_result_t w)
++{
++	(void)arg;
++	(void)w;
++	/* After the boot's busy part, and after the audio DSP has done its RPMh votes. */
++	wl_sleep(35000);
++	printf("PANDORA WLAN: start\n");
++	int e = wl_bringup();
++	printf("PANDORA WLAN: finished, %d%s\n", e, e ? "" : " (the chip answers)");
++	thread_terminate(current_thread());
++}
++
++void pandora_wlan_init(void);
++
++void
++pandora_wlan_init(void)
++{
++	thread_t thread;
++	int on = 0;
++	(void)PE_parse_boot_argn("pandora_wlan", &on, sizeof(on));
++	if (on && kernel_thread_start(wl_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++#endif /* PANDORA */
+diff --git a/bsd/dev/pandora_wlan_tables.h b/bsd/dev/pandora_wlan_tables.h
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/pandora_wlan_tables.h
+@@ -0,0 +1,203 @@
++/* From this phone's device tree, /soc/pcie@1c00000: qcom,phy-sequence, qcom,pcie-sm-seq, qcom,pcie-sm-branch-seq. */
++static const uint32_t wl_phy_seq[][3] = {
++	{0x1440, 0x3, 0},
++	{0x30, 0x1b, 0},
++	{0x34, 0x14, 0},
++	{0x7c, 0x0, 0},
++	{0x80, 0x40, 0},
++	{0x84, 0x0, 0},
++	{0xb4, 0x4, 0},
++	{0xe0, 0x5, 0},
++	{0xe4, 0x0, 0},
++	{0xf4, 0x7, 0},
++	{0xf8, 0x1f, 0},
++	{0x58, 0x90, 0},
++	{0x118, 0x2, 0},
++	{0x11c, 0xd, 0},
++	{0x148, 0x53, 0},
++	{0x14c, 0x54, 0},
++	{0x2dc, 0xb, 0},
++	{0x2ec, 0x4, 0},
++	{0x2f0, 0x5, 0},
++	{0x2f4, 0x15, 0},
++	{0x370, 0x0, 0},
++	{0x378, 0x89, 0},
++	{0x3b4, 0x2d, 0},
++	{0x128, 0x20, 0},
++	{0x3d8, 0x1c, 0},
++	{0x3e0, 0x4, 0},
++	{0x2b8, 0x1, 0},
++	{0x2bc, 0x5, 0},
++	{0x2c4, 0x0, 0},
++	{0x2c8, 0x0, 0},
++	{0x2b4, 0x0, 0},
++	{0x258, 0x40, 0},
++	{0x25c, 0x42, 0},
++	{0x284, 0x18, 0},
++	{0x298, 0x12, 0},
++	{0x2ac, 0x18, 0},
++	{0x418, 0xc2, 0},
++	{0x41c, 0xc2, 0},
++	{0x420, 0x18, 0},
++	{0x428, 0xf, 0},
++	{0x434, 0x62, 0},
++	{0x460, 0xe4, 0},
++	{0x464, 0x63, 0},
++	{0x468, 0xd8, 0},
++	{0x46c, 0x99, 0},
++	{0x470, 0x67, 0},
++	{0x484, 0xa4, 0},
++	{0x488, 0xa4, 0},
++	{0x48c, 0x28, 0},
++	{0x490, 0x9f, 0},
++	{0x494, 0x48, 0},
++	{0x498, 0x24, 0},
++	{0x51c, 0x1, 0},
++	{0x520, 0x0, 0},
++	{0x31c, 0xff, 0},
++	{0x320, 0xff, 0},
++	{0x308, 0x30, 0},
++	{0x30c, 0x3, 0},
++	{0x398, 0x1f, 0},
++	{0x39c, 0x1f, 0},
++	{0x3a0, 0xd, 0},
++	{0x830, 0x1b, 0},
++	{0x834, 0x14, 0},
++	{0x87c, 0x0, 0},
++	{0x880, 0x40, 0},
++	{0x884, 0x0, 0},
++	{0x8b4, 0x4, 0},
++	{0x8e0, 0x5, 0},
++	{0x8e4, 0x0, 0},
++	{0x8f4, 0x7, 0},
++	{0x8f8, 0x1f, 0},
++	{0x858, 0x90, 0},
++	{0x918, 0x2, 0},
++	{0x91c, 0xd, 0},
++	{0x948, 0x53, 0},
++	{0x94c, 0x54, 0},
++	{0xadc, 0xb, 0},
++	{0xaec, 0x4, 0},
++	{0xaf0, 0x5, 0},
++	{0xaf4, 0x15, 0},
++	{0xb70, 0x0, 0},
++	{0xb78, 0x89, 0},
++	{0xbb4, 0x2d, 0},
++	{0x928, 0x20, 0},
++	{0xbd8, 0x1c, 0},
++	{0xbe0, 0x4, 0},
++	{0xab8, 0x1, 0},
++	{0xabc, 0x5, 0},
++	{0xac4, 0x0, 0},
++	{0xac8, 0x0, 0},
++	{0xab4, 0x0, 0},
++	{0xa58, 0x40, 0},
++	{0xa5c, 0x42, 0},
++	{0xa84, 0x18, 0},
++	{0xa98, 0x12, 0},
++	{0xaac, 0x18, 0},
++	{0xc18, 0xc2, 0},
++	{0xc1c, 0xc2, 0},
++	{0xc20, 0x18, 0},
++	{0xc28, 0xf, 0},
++	{0xc34, 0x62, 0},
++	{0xc60, 0xe4, 0},
++	{0xc64, 0x63, 0},
++	{0xc68, 0xd8, 0},
++	{0xc6c, 0x99, 0},
++	{0xc70, 0x67, 0},
++	{0xc84, 0xa4, 0},
++	{0xc88, 0xa4, 0},
++	{0xc8c, 0x28, 0},
++	{0xc90, 0x9f, 0},
++	{0xc94, 0x48, 0},
++	{0xc98, 0x24, 0},
++	{0xd1c, 0x1, 0},
++	{0xd20, 0x0, 0},
++	{0xb1c, 0xff, 0},
++	{0xb20, 0xff, 0},
++	{0xb08, 0x30, 0},
++	{0xb0c, 0x3, 0},
++	{0xb98, 0x1f, 0},
++	{0xb9c, 0x1f, 0},
++	{0xba0, 0xd, 0},
++	{0x1000, 0x93, 0},
++	{0x1004, 0x1, 0},
++	{0x1010, 0x6, 0},
++	{0x1014, 0x16, 0},
++	{0x1018, 0x36, 0},
++	{0x101c, 0x4, 0},
++	{0x1020, 0xa, 0},
++	{0x1024, 0x1a, 0},
++	{0x1028, 0x34, 0},
++	{0x1030, 0x55, 0},
++	{0x1034, 0x55, 0},
++	{0x1038, 0x1, 0},
++	{0x103c, 0x1, 0},
++	{0x1060, 0xf8, 0},
++	{0x1064, 0x1, 0},
++	{0x1070, 0x6, 0},
++	{0x1074, 0x16, 0},
++	{0x1078, 0x36, 0},
++	{0x107c, 0xa, 0},
++	{0x1080, 0x4, 0},
++	{0x1084, 0xd, 0},
++	{0x1088, 0x41, 0},
++	{0x1090, 0xab, 0},
++	{0x1094, 0xaa, 0},
++	{0x1098, 0x1, 0},
++	{0x109c, 0x0, 0},
++	{0x10bc, 0xa, 0},
++	{0x10c0, 0x1, 0},
++	{0x10cc, 0x62, 0},
++	{0x10d0, 0x2, 0},
++	{0x10dc, 0x14, 0},
++	{0x10e0, 0x90, 0},
++	{0x10e4, 0x82, 0},
++	{0x10f4, 0xf, 0},
++	{0x1110, 0x8, 0},
++	{0x1120, 0x46, 0},
++	{0x1124, 0x4, 0},
++	{0x1140, 0x14, 0},
++	{0x1164, 0x34, 0},
++	{0x1170, 0xa0, 0},
++	{0x1174, 0x16, 0},
++	{0x1184, 0x88, 0},
++	{0x1188, 0x4, 0},
++	{0x1198, 0xf, 0},
++	{0x12b4, 0x2, 0},
++	{0x1570, 0x17, 0},
++	{0x1578, 0x2e, 0},
++	{0x1590, 0xcc, 0},
++	{0x15b8, 0x40, 0},
++	{0x15dc, 0x4, 0},
++	{0x15e0, 0x2, 0},
++	{0x1818, 0xc0, 0},
++	{0x15f8, 0x0, 0},
++	{0x15fc, 0x22, 0},
++	{0x180c, 0x1d, 0},
++	{0x181c, 0xc1, 0},
++	{0x1890, 0x0, 0},
++	{0x18a0, 0x16, 0},
++	{0x18f0, 0x27, 0},
++	{0x18f4, 0x27, 0},
++	{0x1908, 0x2, 0},
++	{0x195c, 0x2e, 0},
++	{0x197c, 0x3, 0},
++	{0x1984, 0x28, 0},
++	{0x198c, 0xf, 0},
++	{0x19ac, 0xf2, 0},
++	{0x19c0, 0xf2, 0},
++	{0x19d0, 0x1f, 0},
++	{0x1400, 0x0, 0},
++	{0x1444, 0x3, 0},
++};
++static const uint32_t wl_sm_seq[] = {
++	0x1c018081, 0x70074002, 0x50028000, 0x28007003, 0x80804002, 0x70021c01,
++	0x18002802, 0x70005000, 0x10004000, 0x80814002, 0x18001c01, 0x1c018080,
++	0x1000,
++};
++static const uint32_t wl_sm_branch[] = {
++	0x4, 0x1c, 0x24, 0x2c, 0x0, 0x0,
++	0x0,
++};

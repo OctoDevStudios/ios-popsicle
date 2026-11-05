@@ -1,0 +1,24 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -1206,7 +1206,7 @@
+ 	bool stopped;
+ } sweet_crashes[SWEET_CRASH_SLOTS];
+ static int sweet_crash_limit = -1;
+-static const char *const sweet_crash_keep[] = {"launchd", "SpringBoard", "backboardd", "runningboardd", "logd",
++static const char *const sweet_crash_keep[] = {"pandora_sink", "launchd", "SpringBoard", "backboardd", "runningboardd", "logd",
+     "notifyd", "configd", "securityd", "keybagd", "ReportCrash", "mediaserverd", "audiomxd", "lsd", "installd",
+     "UserEventAgent", "cfprefsd", "containermanager"};
+ 
+@@ -1294,6 +1294,11 @@
+ 	if (sweet_sink_mode <= 0 || path == NULL) {
+ 		return NULL;
+ 	}
++	/* popsicle (the 17 Pro's post31 note): an app extension is not a launchd job: its host waits for it to check in and
++	 * kills the sink, which then counted as the sink's own crashes and stopped it for every daemon. */
++	if (strnstr(path, ".appex/", MAXPATHLEN) != NULL) {
++		return NULL;
++	}
+ 	const char *slash = strrchr(path, '/');
+ 	char name[MAXCOMLEN + 1];
+ 	strlcpy(name, slash ? slash + 1 : path, sizeof(name));

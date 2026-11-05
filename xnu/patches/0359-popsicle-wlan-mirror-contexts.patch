@@ -1,0 +1,138 @@
+xnu 0359: Wi-Fi: contexts and capabilities exactly as Android's MHI, register dump at SYS_ERR; modem TFTP traces
+
+--- a/bsd/dev/pandora_adsp.c	2026-11-04 22:27:55
++++ b/bsd/dev/pandora_adsp.c	2026-11-04 22:27:55
+@@ -3407,7 +3407,7 @@
+  * 0358: tqftpserv in small: /readonly/firmware from the read-only firmware partition already mounted, /readwrite in RAM
+  * only (gone at the next boot), nothing else. wsize 1 and a block size that fits one message, whatever is asked.
+  */
+-#define TF_BLK_MAX   3584u
++#define TF_BLK_MAX   3584u              /* one message of MS_MSG_MAX */
+ #define TF_STORE_PA  0xe5000000ull      /* 16 files of 1 MiB */
+ #define TF_STORE_SZ  0x100000u
+ static struct {
+@@ -3602,11 +3602,19 @@
+ 		if (want_seek) { TF_OPT("seek", seek); }
+ #undef TF_OPT
+ 		ms_raw_reply(m, (const uint8_t *)oack, ol);
++		printf("PANDORA MODEM: TFTP answer: size %llu, block %u, %u option bytes%s\n", tf_c[c].size, tf_c[c].blk, ol, tf_c[c].fat ? ", from the firmware partition" : "");
+ 		return;
+ 	}
+ 	if (c < 0) {
+ 		return;
++	}
++	static uint32_t tf_acks;
++	if (op == 4 && (tf_acks++ % 512) == 0) {
++		printf("PANDORA MODEM: TFTP ack %u of port %u (%u acks so far)\n", (uint32_t)(p[2] << 8 | p[3]), from, tf_acks);
+ 	}
++	if (op == 5) {
++		printf("PANDORA MODEM: TFTP error from the modem: code %u %s\n", (uint32_t)(p[2] << 8 | p[3]), n > 4 ? (const char *)p + 4 : "");
++	}
+ 	if (op == 4 && n >= 4 && !tf_c[c].write) {
+ 		tf_send_block(m, c, (uint32_t)(p[2] << 8 | p[3]));
+ 	} else if (op == 3 && n >= 4 && tf_c[c].write) {
+@@ -3833,8 +3841,13 @@
+ static void
+ ms_tx_step(void)
+ {
++	static uint32_t refused;
+ 	while (ms_ch && __atomic_load_n(&ms_out_w, __ATOMIC_ACQUIRE) != ms_out_r) {
+-		if (qcom_glink_send(&ed_modem.gl, ms_ch, ms_out[ms_out_r % MS_RING].d, ms_out[ms_out_r % MS_RING].len) != QcomGlinkOk) {
++		const int e = qcom_glink_send(&ed_modem.gl, ms_ch, ms_out[ms_out_r % MS_RING].d, ms_out[ms_out_r % MS_RING].len);
++		if (e != QcomGlinkOk) {
++			if (refused++ % 5000 == 0) {
++				printf("PANDORA MODEM: reply of %u bytes refused %d (%u times)\n", ms_out[ms_out_r % MS_RING].len, e, refused);
++			}
+ 			return;
+ 		}
+ 		__atomic_fetch_add(&ms_out_r, 1, __ATOMIC_RELEASE);
+--- a/bsd/dev/pandora_wlan.c	2026-11-04 22:27:55
++++ b/bsd/dev/pandora_wlan.c	2026-11-04 22:27:55
+@@ -522,7 +522,8 @@
+  */
+ #define WF_SEG   0x80000u
+ #define WF_MAX   0x800000ull
+-#define WF_NER   3u                     /* cnss_mhi_events without satellite: control, IPCR data, bandwidth */
++#define WF_NER   4u                     /* cnss_mhi_events: control, data, bandwidth, and the satellite's offload ring */
++#define WF_RINGS 3u                     /* the fourth has no context: offload, skipped by mhi_init_dev_ctxt */
+ #define WF_ELS   256u
+ 
+ /* 0349: below 4 GiB like Android's IOVAs (0xa0000000 on), non cached: low-bank RAM XNU does not use (Android's System RAM). */
+@@ -902,6 +903,9 @@
+ 			rv[k].len = WF_SEG;
+ 		}
+ 		wf_flush(rv_pa, 0x1000);
++		for (uint32_t o = 0x60; o < 0x78; o += 4) {
++			wr(mhi, bhie + o, 0);   /* mhi_prepare_for_power_up: POR values are undefined */
++		}
+ 		wr(mhi, bhie + 0x64, (uint32_t)(rv_pa >> 32));
+ 		wr(mhi, bhie + 0x60, (uint32_t)rv_pa);
+ 		wr(mhi, bhie + 0x68, 15u * 16u);
+@@ -949,11 +953,21 @@
+ 
+ 	/* mhi_init_dev_ctxt, mhi_init_mmio: no channel on, two event rings, the command ring. */
+ 	const uint64_t chan_pa = ctx_pa, er_pa = ctx_pa + 0x2000, cmd_pa = ctx_pa + 0x3000;
+-	const uint64_t ring_pa = ctx_pa + 0x10000, cmdring_pa = ctx_pa + 0x20000, rlen = WF_ELS * 16u;
+-	for (unsigned r = 0; r < WF_NER; r++) {
++	/* 0359: every context as mhi_init_dev_ctxt leaves it: ring sizes 32, 256, 32; channels of cnss_mhi_channels typed. */
++	const uint64_t ring_pa = ctx_pa + 0x10000, cmdring_pa = ctx_pa + 0x20000;
++	static const uint32_t er_len[WF_RINGS] = {32u * 16u, WF_ELS * 16u, 32u * 16u};
++	static const struct { uint8_t ch, dir; } typed[6] = {{0, 1}, {1, 2}, {4, 1}, {5, 2}, {20, 1}, {21, 2}};
++	for (unsigned k = 0; k < 6; k++) {
++		volatile uint32_t *cc = (volatile uint32_t *)(ctx + 44u * typed[k].ch);
++		cc[0] = 2u << 8;                /* disabled, burst off */
++		cc[1] = typed[k].dir;
++		cc[2] = 1;
++	}
++	for (unsigned r = 0; r < WF_RINGS; r++) {
+ 		volatile uint32_t *c = (volatile uint32_t *)(ctx + 0x2000 + 44u * r);
+ 		const uint64_t base = ring_pa + r * 0x2000u;
+ 		c[1] = 1;                       /* MHI_ER_TYPE_VALID */
++		const uint64_t rlen = er_len[r];
+ 		c[2] = r == 1 ? 2 : 1;          /* cnss_mhi_events .irq: 1, 2, 1 */
+ 		c[3] = (uint32_t)base; c[4] = (uint32_t)(base >> 32);
+ 		c[5] = (uint32_t)rlen; c[6] = 0;
+@@ -964,7 +978,7 @@
+ 	{
+ 		volatile uint32_t *c = (volatile uint32_t *)(ctx + 0x3000);
+ 		c[3] = (uint32_t)cmdring_pa; c[4] = (uint32_t)(cmdring_pa >> 32);
+-		c[5] = (uint32_t)rlen; c[6] = 0;
++		c[5] = 128u * 16u; c[6] = 0;    /* CMD_EL_PER_RING */
+ 		c[7] = (uint32_t)cmdring_pa; c[8] = (uint32_t)(cmdring_pa >> 32);
+ 		c[9] = (uint32_t)cmdring_pa; c[10] = (uint32_t)(cmdring_pa >> 32);
+ 	}
+@@ -978,11 +992,22 @@
+ 	wr(mhi, 0x9c, 0); wr(mhi, 0x98, WF_WIN_BASE);
+ 	wr(mhi, 0x8c, 0); wr(mhi, 0x88, WF_WIN_END);
+ 	wr(mhi, 0xa4, 0); wr(mhi, 0xa0, WF_WIN_END);
+-	for (unsigned r = 0; r < WF_NER; r++) {
+-		const uint64_t wp = ring_pa + r * 0x2000u + rlen - 16;
++	for (unsigned r = 0; r < WF_RINGS; r++) {
++		const uint64_t wp = ring_pa + r * 0x2000u + er_len[r] - 16;
+ 		wr(mhi, erdb + 8 * r + 4, (uint32_t)(wp >> 32));
+ 		wr(mhi, erdb + 8 * r, (uint32_t)wp);
+ 	}
++	/* 0359: mhi_misc_init_mmio: the capabilities Android's log says it sets up (bandwidth on ring 2, host notification). */
++	for (uint32_t off = rd(mhi, 0x24), n = 0; off && off < 0x1000 && n < 16; n++) {
++		const uint32_t cap = rd(mhi, off);
++		printf("PANDORA WLAN: capability %u at %#x: %#x, next word %#x\n", cap >> 24, off, cap, rd(mhi, off + 4));
++		if ((cap >> 24) == 3) {
++			wr(mhi, off + 4, (126u << 25) | (1u << 24) | (2u << 19));
++		} else if ((cap >> 24) == 6) {
++			wr(mhi, off + 4, (1u << 31) | 124u);
++		}
++		off = (cap >> 12) & 0xfff;
++	}
+ 	wr(mhi, 0x38, (rd(mhi, 0x38) & ~0xff00u) | (2u << 8));      /* M0 */
+ 	wf_state(mhi, bhi, "M0 asked");
+ 	(void)pandora_log_sync();
+@@ -1003,6 +1028,9 @@
+ 		const volatile uint32_t *c0 = (const volatile uint32_t *)(ctx + 0x2000);
+ 		printf("PANDORA WLAN: SYSERR: event context 0: %08x %08x %08x base %08x%08x len %08x rp %08x%08x wp %08x%08x\n",
+ 		    c0[0], c0[1], c0[2], c0[4], c0[3], c0[5], c0[8], c0[7], c0[10], c0[9]);
++		for (uint32_t o = 0; o < 0xc0; o += 0x20) {
++			printf("PANDORA WLAN: MMIO %#x: %08x %08x %08x %08x %08x %08x %08x %08x\n", o, rd(mhi, o), rd(mhi, o + 4), rd(mhi, o + 8), rd(mhi, o + 12), rd(mhi, o + 16), rd(mhi, o + 20), rd(mhi, o + 24), rd(mhi, o + 28));
++		}
+ 		printf("PANDORA WLAN: SYSERR: registers: cfg %#x ca %#x:%#x ea %#x:%#x cr %#x:%#x ctrl base %#x limit %#x\n", rd(mhi, 0x10), rd(mhi, 0x5c), rd(mhi, 0x58),
+ 		    rd(mhi, 0x64), rd(mhi, 0x60), rd(mhi, 0x6c), rd(mhi, 0x68), rd(mhi, 0x80), rd(mhi, 0x88));
+ 		wf_rom_report(mhi, bhi);

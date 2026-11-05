@@ -1,0 +1,32 @@
+diff --git a/bsd/dev/pandora_adsp.c b/bsd/dev/pandora_adsp.c
+--- a/bsd/dev/pandora_adsp.c
++++ b/bsd/dev/pandora_adsp.c
+@@ -1443,7 +1443,9 @@
+ #define PRM_PARAM_HW_CLK      0x0800102Cu
+ #define PRM_CLK_PRI_TDM_IBIT  0x200u
+ #define PRM_CLK_ATTR          4u        /* invert, couple no */
+-#define SPK_TDM_HZ            (48000u * 2u * 32u)
++/* popsicle: its ACDB says 4 slots of 32 bits and the DT qcom,tdm-max-slots = 4 (two speakers and the haptics amp), so
++ * msm_common.c asks 48000 x 32 x 4. With the 17 Pro's 3.072 MHz, GRAPH_START of the TDM subgraph returned 1. */
++#define SPK_TDM_HZ            (48000u * 4u * 32u)
+ #define SPK_SID_INDEX         1u
+ #define SPK_TLMM_PA           0x0f100000u
+ #define SPK_TDM_GPIO0         122u
+diff --git a/bsd/dev/pandora_amp.c b/bsd/dev/pandora_amp.c
+--- a/bsd/dev/pandora_amp.c
++++ b/bsd/dev/pandora_amp.c
+@@ -677,12 +677,12 @@
+ {
+ 	int err = pa_bits(addr, 0x2c0c, 0x1f, 3);
+ 	err = err ? err : pa_bits(addr, 0x2c04, 0x800, 0x800);
+-	err = err ? err : pa_bits(addr, 0x2c04, 0x7e0, 0x21u << 5);
++	err = err ? err : pa_bits(addr, 0x2c04, 0x7e0, 0x28u << 5)   /* popsicle: 6.144 MHz, code 0x28 */;
+ 	err = err ? err : pa_bits(addr, 0x2c04, 0x10, 0);
+ 	err = err ? err : pa_bits(addr, 0x2c04, 0x7, 0);
+ 	err = err ? err : pa_bits(addr, 0x2c04, 0x800, 0);
+ 	err = err ? err : pa_bits(addr, 0x2c04, 0x10, 0x10);
+-	err = err ? err : pa_write1(addr, 0x2d10, 0x3c024);
++	err = err ? err : pa_write1(addr, 0x2d10, 0x21012)   /* cs35l43_component_set_sysclk above 6 MHz: fs1 0x12, fs2 0x21 */;
+ 	err = err ? err : pa_bits(addr, 0x2c04, 0x10000, 0);
+ 	return err;
+ }

@@ -1,0 +1,441 @@
+diff --git a/shim/src/lx_rt.c b/shim/src/lx_rt.c
+index b50e0ac..b25e53f 100644
+--- a/shim/src/lx_rt.c
++++ b/shim/src/lx_rt.c
+@@ -496,7 +496,7 @@ int device_rename(struct device *dev, const char *name) {
+   copy[length] = 0; memcpy(dev->namebuf, copy, length + 1); dev->name = dev->namebuf; return 0;
+ }
+ int device_add(struct device *d) {
+-  if (d->registered) return -EBUSY;
++  if (d->registered) { lx_log(3, "device_add: %s already registered (references %d)", d->name ? d->name : "?", (int)d->references); return -EBUSY; }
+   if (!d->references) return -EINVAL;
+   if (d->class && !class_registered(d->class)) return -EINVAL;
+   unsigned slot; for (slot = 0; slot < ARRAY_SIZE(g_devs) && g_devs[slot]; slot++) { }
+diff --git a/src/nw_cfg80211_control.c b/src/nw_cfg80211_control.c
+index f60bd25..7480084 100644
+--- a/src/nw_cfg80211_control.c
++++ b/src/nw_cfg80211_control.c
+@@ -1,6 +1,7 @@
+ /* XNU control transport for the original cfg80211/mac80211 station operations.
+  * Socket callbacks enqueue; this file executes only on the wireless worker. */
+ #include "lx_pci.h"
++#include "lx_plat.h"
+ #include <net/cfg80211.h>
+ #include "cfg80211/core.h"
+ #include "cfg80211/rdev-ops.h"
+@@ -69,7 +70,7 @@ static int scan(struct cfg80211_registered_device *rdev, const struct nw_control
+   unsigned channels = freq_bytes ? freq_bytes / 4 : ieee80211_get_num_supported_channels(wiphy);
+   if (!channels) return -EINVAL;
+   size_t ssid_offset = sizeof(struct cfg80211_scan_request_int) + channels * sizeof(void *);
+-  size_t ie_offset = ssid_offset + (ssid_bytes / 33) * sizeof(struct cfg80211_ssid);
++  size_t ie_offset = ssid_offset + (ssid_bytes / 33 + 1) * sizeof(struct cfg80211_ssid);
+   struct cfg80211_scan_request_int *request = kzalloc(ie_offset + ie_bytes, GFP_KERNEL);
+   if (!request) return -ENOMEM;
+   request->req.ssids = (void *)((u8 *)request + ssid_offset);
+@@ -79,6 +80,7 @@ static int scan(struct cfg80211_registered_device *rdev, const struct nw_control
+     request->req.ssids[i].ssid_len = ssids[i * 33];
+     memcpy(request->req.ssids[i].ssid, ssids + i * 33 + 1, ssids[i * 33]);
+   }
++  if (!request->req.n_ssids) request->req.n_ssids = 1;   /* the wildcard SSID (rdev_scan refuses none with a list) */
+   for (unsigned i = 0; i < channels && freq_bytes; i++) {
+     struct ieee80211_channel *channel = ieee80211_get_channel(wiphy, get_unaligned_le32(freqs + i * 4));
+     if (!channel) { kfree(request); return -EINVAL; }
+@@ -106,6 +108,33 @@ static int scan(struct cfg80211_registered_device *rdev, const struct nw_control
+   dev_hold(primary); nl80211_send_scan_start(rdev, primary->ieee80211_ptr);
+   return 0;
+ }
++/* Bring-up, no supplicant on the control channel yet: a scan from the worker, its networks in the log. */
++int nw_cfg80211_direct_scan(void) {
++  if (!primary) return -ENODEV;
++  struct cfg80211_registered_device *rdev = wiphy_to_rdev(primary->ieee80211_ptr->wiphy);
++  struct nw_control_view none; memset(&none, 0, sizeof(none));
++  rtnl_lock();
++  int result = dev_open(primary, NULL);
++  if (!result) { wiphy_lock(&rdev->wiphy); result = scan(rdev, &none); wiphy_unlock(&rdev->wiphy); }
++  rtnl_unlock();
++  return result;
++}
++static void direct_scan_log(struct cfg80211_registered_device *rdev, bool aborted) {
++  unsigned count = 0; struct cfg80211_internal_bss *entry;
++  rcu_read_lock(); spin_lock_bh(&rdev->bss_lock);
++  list_for_each_entry(entry, &rdev->bss_list, list) {
++    const struct cfg80211_bss_ies *ies = rcu_dereference(entry->pub.ies);
++    char name[33] = ""; const u8 *p = ies ? ies->data : NULL; size_t left = ies ? ies->len : 0;
++    while (p && left >= 2 && (size_t)p[1] + 2 <= left) {
++      if (p[0] == 0) { size_t n = p[1] > 32 ? 32 : p[1]; for (size_t i = 0; i < n; i++) name[i] = p[2 + i] >= 32 && p[2 + i] < 127 ? p[2 + i] : '?'; name[n] = 0; break; }
++      left -= (size_t)p[1] + 2; p += (size_t)p[1] + 2;
++    }
++    if (count < 40) lx_log(4, "NW network \"%s\" %u MHz %d dBm", name, entry->pub.channel ? entry->pub.channel->center_freq : 0, entry->pub.signal / 100);
++    count++;
++  }
++  spin_unlock_bh(&rdev->bss_lock); rcu_read_unlock();
++  lx_log(4, "NW direct scan done: %u networks, aborted %d", count, aborted);
++}
+ static int snapshot_build(struct cfg80211_registered_device *rdev) {
+   snapshot_free(); struct bss_snapshot **tail = &snapshot;
+   size_t memory = 0; unsigned count = 0;
+@@ -400,7 +429,20 @@ int nw_cfg80211_set_power(int enabled) {
+   generation++; snapshot_free();
+   int result = enabled ? dev_open(primary, NULL) : 0;
+   if (enabled) radio_enabled = result == 0;
+-  rtnl_unlock(); return result;
++  rtnl_unlock();
++  /* The firmware answers the first pdev setup command from the WMI credit
++   * update that follows a message of its own: when nothing comes back for the
++   * 3 s wait, the start fails although the firmware is still running. Let it
++   * settle and start again, outside rtnl. */
++  for (int attempt = 1; enabled && result && attempt <= 1; attempt++) {
++    lx_log(4, "wifi: radio on retry %d after %d", attempt, result);
++    if (lx_plat && lx_plat->sleep_ms) lx_plat->sleep_ms(500);
++    rtnl_lock();
++    result = dev_open(primary, NULL);
++    if (enabled) radio_enabled = result == 0;
++    rtnl_unlock();
++  }
++  return result;
+ }
+ static void ready(struct work_struct *work) {
+   (void)work;
+@@ -436,6 +478,7 @@ void nl80211_send_scan_start(struct cfg80211_registered_device *rdev, struct wir
+ }
+ struct sk_buff *nl80211_build_scan_msg(struct cfg80211_registered_device *rdev, struct wireless_dev *wdev, bool aborted) {
+   (void)rdev;
++  direct_scan_log(rdev, aborted);
+   if (!primary || wdev != primary->ieee80211_ptr) return NULL;
+   struct sk_buff *message = alloc_skb(NW_CONTROL_HEADER_SIZE, GFP_KERNEL);
+   if (!message) return NULL;
+diff --git a/src/nw_debug.c b/src/nw_debug.c
+index 3990410..4ceebad 100644
+--- a/src/nw_debug.c
++++ b/src/nw_debug.c
+@@ -10,7 +10,11 @@ static void emit(int level, const char *fmt, va_list ap) {
+ void ath12k_info(struct ath12k_base *ab, const char *fmt, ...) { (void)ab; va_list ap; va_start(ap, fmt); emit(6, fmt, ap); va_end(ap); }
+ void ath12k_err(struct ath12k_base *ab, const char *fmt, ...) { (void)ab; va_list ap; va_start(ap, fmt); emit(3, fmt, ap); va_end(ap); }
+ void __ath12k_warn(struct device *dev, const char *fmt, ...) { (void)dev; va_list ap; va_start(ap, fmt); emit(4, fmt, ap); va_end(ap); }
+-void __ath12k_dbg(struct ath12k_base *ab, enum ath12k_debug_mask mask, const char *fmt, ...) { (void)ab; (void)mask; va_list ap; va_start(ap, fmt); emit(7, fmt, ap); va_end(ap); }
++void __ath12k_dbg(struct ath12k_base *ab, enum ath12k_debug_mask mask, const char *fmt, ...) {
++  char b[220]; va_list ap; (void)ab; (void)mask;
++  va_start(ap, fmt); vsnprintf(b, sizeof b, fmt, ap); va_end(ap);
++  lx_log(6, "dbg %s", b);
++}
+ void ath12k_dbg_dump(struct ath12k_base *ab, enum ath12k_debug_mask mask, const char *msg, const char *prefix, const void *buf, size_t len) {
+   (void)ab; (void)prefix; if (!(ath12k_debug_mask & mask)) return; if (msg) lx_plat->log(7, msg);
+   const u8 *p = buf; char l[100];
+diff --git a/src/nw_mainline.c b/src/nw_mainline.c
+index b086bc0..2fae86f 100644
+--- a/src/nw_mainline.c
++++ b/src/nw_mainline.c
+@@ -7,6 +7,12 @@
+ #include "nw_cfg80211_control.h"
+ #include "nw_events.h"
+ 
++int nw_wifi_wmi_credits(void);
++int nw_wifi_qmi_probe(void);
++unsigned long nw_wifi_irq_count(void);
++unsigned int nw_wifi_irq_bits(void);
++u64 nw_wifi_radio_not_before(void);
++
+ #define UI_BSS_MAX 128
+ static spinlock_t boundary_lock;
+ static struct nw_wifi_status status;
+@@ -313,6 +319,17 @@ static void transmit(void) {
+   }
+ }
+ void nw_mainline_run(void) {
++  static u64 next_sample;
++  if (lx_now_ms() >= next_sample) {
++    next_sample = lx_now_ms() + 3000;
++    int credits = nw_wifi_wmi_credits();
++    lx_log(4, "wifi: sample irq %lu bits %x, wmi credits %d", nw_wifi_irq_count(), nw_wifi_irq_bits(), credits);
++    static u64 next_probe;
++    if (credits == 0 && lx_now_ms() >= next_probe) {
++      next_probe = lx_now_ms() + 10000;
++      lx_log(4, "wifi: qmi probe -> %d", nw_wifi_qmi_probe());
++    }
++  }
+   bool timed_out = false;
+   lx_shared_spin_lock(&boundary_lock);
+   if (join_waiting && lx_now_ms() >= join_deadline) {
+@@ -324,7 +341,10 @@ void nw_mainline_run(void) {
+   if (timed_out && nw_events.connect_done) nw_events.connect_done(NW_RES_TIMEOUT);
+   bool power_pending, power_enabled; unsigned power_revision;
+   lx_shared_spin_lock(&boundary_lock); power_pending = radio.pending; power_enabled = radio.enabled; power_revision = radio.revision; lx_shared_spin_unlock(&boundary_lock);
+-  if (power_pending) {
++  if (power_pending && power_enabled && lx_now_ms() < nw_wifi_radio_not_before()) {
++    static bool told;
++    if (!told) { told = true; lx_log(4, "wifi: radio on held until %llu ms (let the firmware settle)", (unsigned long long)nw_wifi_radio_not_before()); }
++  } else if (power_pending) {
+     int result = nw_cfg80211_set_power(power_enabled);
+     if (!result) {
+       lx_shared_spin_lock(&boundary_lock); if (radio.revision == power_revision) radio.pending = false; lx_shared_spin_unlock(&boundary_lock);
+@@ -336,7 +356,8 @@ void nw_mainline_run(void) {
+       nw_wifi_stats.last_err = result;
+       /* An unsuccessful enable remains off; a new UI request can retry it. */
+       lx_shared_spin_lock(&boundary_lock); if (radio.revision == power_revision) { radio.pending = false; radio.enabled = false; clear_connection(NW_STA_OFF); }
+-      lx_shared_spin_unlock(&boundary_lock); lx_log(4, "wifi: radio request failed: %d", result);
++      lx_shared_spin_unlock(&boundary_lock); lx_log(4, "wifi: radio request failed: %d (wmi credits %d)", result, nw_wifi_wmi_credits());
++      lx_log(4, "wifi: qmi probe after the radio failure -> %d", nw_wifi_qmi_probe());
+     }
+   }
+   struct ui_request pending;
+@@ -369,6 +390,16 @@ void nw_mainline_run(void) {
+       result = nw_control_put(&b, NW_CONTROL_ATTR_SSID, pending.ssid, pending.ssid_length);
+     }
+     if (!result) result = nw_cfg80211_event_send(&b);
++    if (pending.operation == NW_CONTROL_SCAN_REQUEST) {
++      extern int nw_cfg80211_direct_scan(void);
++      static u64 direct_last;
++      if (!direct_last || lx_now_ms() - direct_last >= 13000) {
++        direct_last = lx_now_ms();
++        int direct = nw_cfg80211_direct_scan();
++        lx_log(4, "NW direct scan -> %d", direct);
++        if (direct) lx_log(4, "wifi: qmi probe after the scan -> %d", nw_wifi_qmi_probe());
++      }
++    }
+     if (!result) {
+       lx_shared_spin_lock(&boundary_lock);
+       if (!memcmp(&ui, &pending, sizeof(ui))) {
+diff --git a/src/nw_mhi.c b/src/nw_mhi.c
+index 970bded..cfffea0 100644
+--- a/src/nw_mhi.c
++++ b/src/nw_mhi.c
+@@ -6,25 +6,109 @@
+ 
+ /* Two channels carry the QRTR control traffic (host-to-device 20, device-to-host 21). */
+ static const struct mhi_channel_config nw_channels[] = {
++  { .num = 0, .name = "LOOPBACK", .num_elements = 32, .event_ring = 1, .dir = DMA_TO_DEVICE, .ee_mask = 0x4, .doorbell = MHI_DB_BRST_DISABLE },
++  { .num = 1, .name = "LOOPBACK", .num_elements = 32, .event_ring = 1, .dir = DMA_FROM_DEVICE, .ee_mask = 0x4, .doorbell = MHI_DB_BRST_DISABLE },
++  { .num = 4, .name = "DIAG", .num_elements = 64, .event_ring = 1, .dir = DMA_TO_DEVICE, .ee_mask = 0x4, .doorbell = MHI_DB_BRST_DISABLE },
++  { .num = 5, .name = "DIAG", .num_elements = 64, .event_ring = 1, .dir = DMA_FROM_DEVICE, .ee_mask = 0x4, .doorbell = MHI_DB_BRST_DISABLE },
+   { .num = 20, .name = "IPCR", .num_elements = 64, .event_ring = 1, .dir = DMA_TO_DEVICE, .ee_mask = 0x4, .doorbell = MHI_DB_BRST_DISABLE },
+   { .num = 21, .name = "IPCR", .num_elements = 64, .event_ring = 1, .dir = DMA_FROM_DEVICE, .ee_mask = 0x4, .doorbell = MHI_DB_BRST_DISABLE },
+ };
+ /* Ring 0 takes the device's state changes, ring 1 the channel traffic. */
+ static struct mhi_event_config nw_events[] = {
+   { .num_elements = 32, .irq_moderation_ms = 0, .irq = 1, .mode = MHI_DB_BRST_DISABLE, .data_type = MHI_ER_CTRL },
+-  { .num_elements = 256, .irq_moderation_ms = 1, .irq = 2, .mode = MHI_DB_BRST_DISABLE, .priority = 1 },
++  { .num_elements = 256, .irq_moderation_ms = 0, .irq = 2, .mode = MHI_DB_BRST_DISABLE, .priority = 1 },
++  { .num_elements = 32, .irq_moderation_ms = 0, .irq = 1, .mode = MHI_DB_BRST_DISABLE, .priority = 2 },
++  { .num_elements = 256, .irq_moderation_ms = 0, .irq = 2, .mode = MHI_DB_BRST_DISABLE, .priority = 1, .client_managed = true, .offload_channel = true },
+ };
+ static const struct mhi_controller_config nw_config = {
+-  .max_channels = 128, .timeout_ms = 2000, .buf_len = 8192,
++  .max_channels = 72, .timeout_ms = 10000, .buf_len = 8192,
+   .num_channels = ARRAY_SIZE(nw_channels), .ch_cfg = nw_channels,
+   .num_events = ARRAY_SIZE(nw_events), .event_cfg = nw_events,
+ };
+ 
+ static int op_runtime_get(struct mhi_controller *c) { (void)c; return 0; }
+ static void op_runtime_put(struct mhi_controller *c) { (void)c; }
++#define BHI_STATUS 0x2c
++#define BHI_ERRCODE 0x30
++#define BHI_ERRDBG1 0x34
++#define BHI_ERRDBG2 0x38
++#define BHI_ERRDBG3 0x3c
++#define BHIE_RXVECSTATUS_OFFS 0x78
++#define BHIE_RXVECSTATUS_STATUS_XFER_COMPL 2
++/* What the firmware says when it dies: the registers, then the dump (RDDM) it sends to the table the host programmed. */
++static struct mhi_controller *nw_rddm_c;
++static int nw_rddm_done;
++static int rddm_keyword(const u8 *p, size_t n) {
++  static const char *const k[] = { "assert", "fatal", "exception", "fail", "error", "panic", "abort", "crash", ".c", ".cpp" };
++  for (size_t i = 0; i < n; i++)
++    for (size_t j = 0; j < ARRAY_SIZE(k); j++) {
++      size_t m = 0;
++      while (k[j][m] && i + m < n && (p[i + m] | ((p[i + m] >= 'A' && p[i + m] <= 'Z') ? 0x20 : 0)) == (u8)k[j][m]) m++;
++      if (!k[j][m]) return 1;
++    }
++  return 0;
++}
++void nw_mhi_crash_report(const char *why) {
++  struct mhi_controller *c = nw_rddm_c;
++  if (!c || nw_rddm_done) return;
++  nw_rddm_done = 1;
++  lx_log(4, "CRASH: %s: ee %d state %d, BHI status %08x err %08x dbg %08x %08x %08x", why,
++          (int)mhi_get_exec_env(c), (int)mhi_get_mhi_state(c), readl(c->bhi + BHI_STATUS), readl(c->bhi + BHI_ERRCODE),
++          readl(c->bhi + BHI_ERRDBG1), readl(c->bhi + BHI_ERRDBG2), readl(c->bhi + BHI_ERRDBG3));
++  u32 rx = 0;
++  int i = 0;
++  if (c->bhie) for (; i < 300; i++) {
++    rx = readl(c->bhie + BHIE_RXVECSTATUS_OFFS);
++    if (((rx >> 30) & 3) == BHIE_RXVECSTATUS_STATUS_XFER_COMPL) break;
++    udelay(10000);
++  }
++  lx_log(4, "CRASH: dump status %08x after %d ms, ee now %d", rx, i * 10, (int)mhi_get_exec_env(c));
++  if (!c->rddm_image) return;
++  int lines = 0;
++  for (u32 s = 0; s + 1 < c->rddm_image->entries; s++) {
++    const struct mhi_buf *b = &c->rddm_image->mhi_buf[s];
++    const u8 *p = b->buf;
++    size_t used = 0;
++    for (size_t k = 0; k < b->len; k++) if (p[k]) used++;
++    if (!used) continue;
++    const u32 *w = (const u32 *)p;
++    lx_log(4, "CRASH: segment %u: %zu of %zu bytes used: %08x %08x %08x %08x %08x %08x %08x %08x", s, used, b->len,
++            w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
++    for (size_t k = 0; s == 0 && k < b->len && lines < 150; ) {
++      size_t e = k;
++      while (e < b->len && p[e] >= 0x20 && p[e] < 0x7f) e++;
++      if (e - k >= 8 && rddm_keyword(p + k, e - k)) {
++        char t[161];
++        size_t m = e - k > 160 ? 160 : e - k;
++        memcpy(t, p + k, m); t[m] = 0;
++        lx_log(4, "CRASH: %u+%zx: %s", s, k, t);
++        lines++;
++      }
++      k = e + 1;
++    }
++    /* Second pass: every readable string, to catch the QuRT thread names and the assert text even
++     * when they contain none of the keywords above. */
++    for (size_t k = 0, shown = 0; s == 0 && k < b->len && shown < 60; ) {
++      size_t e = k;
++      while (e < b->len && p[e] >= 0x20 && p[e] < 0x7f) e++;
++      if (e - k >= 10) {
++        char t[121];
++        size_t m = e - k > 120 ? 120 : e - k;
++        memcpy(t, p + k, m); t[m] = 0;
++        lx_log(6, "CRASH: text %zu+%zx: %s", s, k, t);
++        shown++;
++      }
++      k = e + 1;
++    }
++  }
++  lx_log(4, "CRASH: end, %d lines", lines);
++}
++
++void nw_mhi_crash_report_on(struct mhi_controller *c, const char *why) { nw_rddm_c = c; nw_mhi_crash_report(why); }
+ static void op_status_cb(struct mhi_controller *c, enum mhi_callback cb) {
+   struct nw_mhi *n = dev_get_drvdata(c->cntrl_dev);
+   n->last_cb = cb;
++  if (cb == MHI_CB_SYS_ERROR || cb == MHI_CB_FATAL_ERROR || cb == MHI_CB_EE_RDDM) nw_mhi_crash_report("status callback");
+   /* the bulk image stays: the firmware pages its code in from it on demand for as long as it runs */
+   if (cb == MHI_CB_EE_MISSION_MODE) n->mission = 1;
+   if (cb == MHI_CB_SYS_ERROR || cb == MHI_CB_FATAL_ERROR || cb == MHI_CB_EE_RDDM) n->failed = 1;
+@@ -48,11 +132,13 @@ int nw_mhi_register(struct nw_mhi *n, void *bar, size_t bar_len, u32 msi_base, u
+   if (!c->irq) { mhi_free_controller(c); return -ENOMEM; }
+   c->nr_irqs = nw_config.num_events + 1;     /* vector 0 carries the device status, then one per event ring */
+   for (u32 i = 0; i < c->nr_irqs; i++) c->irq[i] = msi_base + i;
+-  c->iova_start = 0; c->iova_stop = dma_limit;
++  c->iova_start = 0x18000000; c->iova_stop = 0xb0000000;  /* cnss_pci_init_smmu */
++  c->rddm_size = 0x780000;
+   c->sbl_size = SZ_512K; c->seg_len = SZ_512K; c->fbc_download = true;
+   c->runtime_get = op_runtime_get; c->runtime_put = op_runtime_put; c->status_cb = op_status_cb;
+   c->read_reg = op_read_reg; c->write_reg = op_write_reg;
+   int r = mhi_register_controller(c, &nw_config);
++  nw_rddm_c = c;
+   if (r) { lx_free(c->irq); mhi_free_controller(c); n->c = 0; }
+   return r;
+ }
+@@ -75,9 +161,19 @@ void nw_mhi_unregister(struct nw_mhi *n) {
+ #define NW_BOOT_SETTLE_MS 200
+ #endif
+ int mhi_init_mmio(struct mhi_controller *mhi_cntrl);
++/* mhi_misc_init_mmio of Android's tree: bandwidth scaling on ring 2 and host notification are advertised. */
++void nw_mhi_caps(struct mhi_controller *c) {
++  u32 off = readl(c->regs + 0x24);
++  for (int n = 0; off && off < 0x1000 && n < 16; n++) {
++    u32 cap = readl(c->regs + off);
++    if ((cap >> 24) == 3) writel((126u << 25) | (1u << 24) | (2u << 19), c->regs + off + 4);
++    else if ((cap >> 24) == 6) writel((1u << 31) | 124u, c->regs + off + 4);
++    off = (cap >> 12) & 0xfff;
++  }
++}
+ void nw_mhi_pre_load(struct mhi_controller *c) {
+-  static int done; if (done) return; done = 1;
+-  lx_delay_ms(NW_BOOT_SETTLE_MS);
+-  int r = mhi_init_mmio(c);
++  /* Android goes straight to the image (mhi log); its contexts are written after READY. */
++  (void)c; return;
++  int r = 0;
+   lx_log(6, "mhi: contexts programmed before the image: %d", r);
+ }
+diff --git a/src/nw_qrtr.c b/src/nw_qrtr.c
+index 1d80def..b771d37 100644
+--- a/src/nw_qrtr.c
++++ b/src/nw_qrtr.c
+@@ -133,7 +133,7 @@ void nw_qrtr_rx(const void *pkt, size_t len) {
+     send_remote(QRTR_TYPE_RESUME_TX, dn, dp, sn, sp, &r, sizeof r, 0);
+   }
+   switch (type) {
+-  case QRTR_TYPE_DATA: { struct sock *s = find_port(dp); lx_log(7, "qrtr: data from %u:%x to port %x, %u bytes%s", sn, sp, dp, size, s ? "" : " (no socket)"); if (s) deliver(s, sn, sp, pl, size); else lx_log(6, "qrtr: no port %x", dp); break; }
++  case QRTR_TYPE_DATA: { struct sock *s = find_port(dp); { const u8 *q = (const u8 *)pl; lx_log(7, "qrtr: data from %u:%x to port %x, %u bytes, QMI type %u msg 0x%x%s", sn, sp, dp, size, size >= 7 ? q[0] : 0, size >= 7 ? (q[3] | q[4] << 8) : 0, s ? "" : " (no socket)"); } if (s) deliver(s, sn, sp, pl, size); else lx_log(6, "qrtr: no port %x", dp); break; }
+   case QRTR_TYPE_RESUME_TX: case QRTR_TYPE_PING: case QRTR_TYPE_EXIT: break;
+   default: ns_handle(sn, sp, (const struct qrtr_ctrl_pkt *)pl, size); break;
+   }
+diff --git a/src/nw_wifi.c b/src/nw_wifi.c
+index 24f470c..c4cc640 100644
+--- a/src/nw_wifi.c
++++ b/src/nw_wifi.c
+@@ -22,7 +22,25 @@ extern unsigned int ath12k_debug_mask;
+ 
+ struct nw_wifi_stats nw_wifi_stats;
+ static struct ieee80211_hw *g_hw;
+-void nw_wifi_hw_ready(struct ieee80211_hw *hw) { g_hw = hw; }
++static u64 radio_not_before;   /* the firmware gets time to settle before the first pdev setup */
++void nw_wifi_hw_ready(struct ieee80211_hw *hw) {
++  g_hw = hw; radio_not_before = lx_now_ms() + 10000;
++}
++u64 nw_wifi_radio_not_before(void) { return radio_not_before; }
++/* Credits left on the WMI endpoint: 2 at connect on this firmware (HTC ready message), refilled by its credit reports. */
++int nw_wifi_wmi_credits(void) {
++  if (!g_hw) return -1;
++  struct ath12k *ar = ath12k_ah_to_ar(g_hw->priv, 0);
++  return ar && ar->ab ? ar->ab->htc.endpoint[ATH12K_HTC_EP_2].tx_credits : -1;
++}
++/* A capability request on the QMI channel (another transport, over MHI): it comes back only if the
++ * firmware still answers at all, which tells a silent WMI pipe apart from a dead chip. */
++int nw_wifi_qmi_probe(void) {
++  extern int ath12k_qmi_request_target_cap(struct ath12k_base *ab);
++  if (!g_hw) return -1;
++  struct ath12k *ar = ath12k_ah_to_ar(g_hw->priv, 0);
++  return ar && ar->ab ? ath12k_qmi_request_target_cap(ar->ab) : -1;
++}
+ int lx_init_cfg80211_init(void);
+ int lx_init_ieee80211_init(void);
+ void lx_exit_cfg80211_exit(void);
+@@ -218,32 +236,38 @@ void nw_board_mac(u8 *a) {
+ 
+ void nw_wifi_irq_mode(int delivered) { lx_irq_polling(!delivered); }
+ void nw_wifi_poll(void) { nw_mainline_poll(); nw_wifi_control_poll(); }
++static unsigned long irq_events; static u32 irq_last;
+ void nw_wifi_irq_pending(uint32_t vectors) {
+   if (!nw_board) return;
++  irq_events++; irq_last = vectors;
+   while (vectors) {
+     unsigned bit = __builtin_ctz(vectors); vectors &= vectors - 1;
+     lx_irq_raise(nw_board->irq_base + bit);
+   }
+ }
++/* How many interrupt deliveries the board reported, and the last vector bits: a stalled WMI
++ * command with this count still moving means the chip talks and the host does not listen. */
++unsigned long nw_wifi_irq_count(void) { return irq_events; }
++u32 nw_wifi_irq_bits(void) { return irq_last; }
+ unsigned nw_wifi_wait_ms(unsigned maximum) {
+   return nw_mainline_pending() || nw_wifi_control_pending() ? 0 : lx_next_wait_ms(maximum);
+ }
+ void nw_wifi_set_platform(const struct lx_platform *p) { lx_plat = p; }
+ int nw_wifi_start(const struct lx_platform *p, const struct nw_board *b) {
+-  lx_plat = p; nw_board = b; ath12k_debug_mask = 0; /* Keep info/warnings and counters; skip HTT/WMI debug formatting in normal traffic. */
++  lx_plat = p; nw_board = b; ath12k_debug_mask = 0x12; /* WMI and MAC traces while the scan is brought up. Keep info/warnings and counters; skip HTT/WMI debug formatting in normal traffic. (The module prints at most 2000 lines per boot, see nw_log in pandora_wlan.c, and the HTC mask spams one line per millisecond of a credit wait.) */
+   nw_wifi_buffer_pool_configure(1024 * 1024);
+   lx_root_init(); lx_log_tap = log_tap; nw_qrtr_init();
+-  int r = nw_mainline_init(); if (r) goto fail;
+-  r = lx_init_cfg80211_init(); if (r) goto fail;
++  int r = nw_mainline_init(); lx_log(6, "wifi: step mainline %d", r); if (r) goto fail;
++  r = lx_init_cfg80211_init(); lx_log(6, "wifi: step cfg80211 %d", r); if (r) goto fail;
+   cfg_started = true;
+-  r = lx_init_ieee80211_init(); if (r) goto fail;
++  r = lx_init_ieee80211_init(); lx_log(6, "wifi: step mac80211 %d", r); if (r) goto fail;
+   mac_started = true;
+-  r = mhi_init_hook(); if (r) goto fail;
++  r = mhi_init_hook(); lx_log(6, "wifi: step mhi bus %d", r); if (r) goto fail;
+   mhi_started = true;
+-  r = nw_qrtr_mhi_register(); if (r) goto fail;
++  r = nw_qrtr_mhi_register(); lx_log(6, "wifi: step qrtr %d", r); if (r) goto fail;
+   qrtr_started = true;
+   nw_wifi_stats.stage = 1;
+-  r = ath12k_wifi7_pci_init();
++  r = ath12k_wifi7_pci_init(); lx_log(6, "wifi: step ath12k pci %d", r);
+   if (r) goto fail;
+   pci_started = true; nw_wifi_stats.stage = 2; return 0;
+ fail:

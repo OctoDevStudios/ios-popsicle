@@ -1,0 +1,323 @@
+xnu 0348: Wi-Fi firmware through MHI (BHI, READY, M0, BHIe, polled), SMMU pass-through; modem metadata mapping fixed
+
+--- a/bsd/dev/pandora_adsp.c	2026-11-04 18:38:30
++++ b/bsd/dev/pandora_adsp.c	2026-11-04 18:38:30
+@@ -745,7 +745,7 @@
+ 	uint64_t md_pa;
+ 	if (pas_md_low) {
+ 		md_pa = pas_md_low;
+-		md = ad_map(md_pa, md_size, VM_WIMG_IO);
++		md = ad_map(md_pa, md_size, VM_WIMG_WCOMB);        /* t9: memcpy to device memory takes an alignment abort */
+ 		if (!md) {
+ 			return ENOMEM;
+ 		}
+@@ -3183,8 +3183,76 @@
+ 			ad_wait(now < fast_until ? 20 : 500);
+ 		} else {
+ 			ad_sleep(now < fast_until ? 1 : 50);
++		}
++	}
++}
++
++/* ---- 0348: for bsd/dev/pandora_wlan.c ---------------------------------------------------- */
++
++int pandora_part_file(const char *name, void *dst, uint64_t max, uint64_t *size);
++int pandora_smmu_pass(uint16_t id, uint16_t mask);
++
++/* A file of /image in the firmware partition (Android's /vendor/firmware_mnt), read only. */
++int
++pandora_part_file(const char *name, void *dst, uint64_t max, uint64_t *size)
++{
++	struct fw_file f;
++	int err = fw_mount();
++	err = err ? err : fw_open(name, true, &f);
++	if (err) {
++		return err;
++	}
++	*size = f.size;
++	return f.size > max ? E2BIG : fw_pread(&f, 0, dst, f.size);
++}
++
++/* Pass a device's streams through the apps SMMU the way the audio streams pass: same S2CR, a free group. */
++int
++pandora_smmu_pass(uint16_t id, uint16_t mask)
++{
++	vm_offset_t s = ad_map(0x15000000u, 0x100000u, VM_WIMG_IO);
++	if (!s) {
++		return ENOMEM;
++	}
++#define SR(o) (*(volatile uint32_t *)(s + (o)))
++	const unsigned nsmr = SR(0x20) & 0xff;      /* SMMU_IDR0.NUMSMRG */
++	uint32_t s2cr = 0;
++	unsigned slot = nsmr;
++	bool have = false;
++	int err = 0;
++	for (unsigned i = 0; i + 1 < nsmr; i++) {
++		const uint32_t smr = SR(0x800 + 4 * i);
++		if (!(smr & 0x80000000u)) {
++			if (slot == nsmr) {
++				slot = i;
++			}
++			continue;
+ 		}
++		const uint32_t sid = smr & 0x7fff, smask = (smr >> 16) & 0x7fff;
++		if (sid == 0x1001 || sid == 0x1041) {
++			s2cr = SR(0xc00 + 4 * i);
++			have = true;
++		}
++		if (((sid ^ id) & ~(smask | mask) & 0x7fff) == 0) {
++			printf("PANDORA SMMU: group %u (id %#x mask %#x) overlaps streams %#x/%#x: not written\n", i, sid, smask, id, mask);
++			err = EEXIST;
++		}
+ 	}
++	if (!err && (!have || slot == nsmr)) {
++		printf("PANDORA SMMU: streams %#x: no audio group to copy (%d) or no free group\n", id, have);
++		err = ENOENT;
++	}
++	if (!err) {
++		SR(0xc00 + 4 * slot) = s2cr;
++		__asm__ volatile ("dsb sy" ::: "memory");
++		SR(0x800 + 4 * slot) = 0x80000000u | (uint32_t)mask << 16 | id;
++		__asm__ volatile ("dsb sy" ::: "memory");
++		printf("PANDORA SMMU: group %u for streams %#x mask %#x: SMR %08x S2CR %08x\n", slot, id, mask,
++		    SR(0x800 + 4 * slot), SR(0xc00 + 4 * slot));
++	}
++#undef SR
++	ml_io_unmap(s, 0x100000u);
++	return err;
+ }
+ 
+ /* ---- 0347: the modem's start ------------------------------------------------------------- */
+--- a/bsd/dev/pandora_wlan.c	2026-11-04 18:38:30
++++ b/bsd/dev/pandora_wlan.c	2026-11-04 18:38:30
+@@ -22,12 +22,17 @@
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ #include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <arm/caches_internal.h>
+ #include "pandora_wlan_tables.h"
+ 
+ extern kern_return_t thread_terminate(thread_t);
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);
+ extern int pandora_rpmh_vrm(const char *res, uint32_t mv, int mode);
+ extern int pandora_rpmh_clk(const char *res);
++extern int pandora_part_file(const char *name, void *dst, uint64_t max, uint64_t *size);
++extern int pandora_smmu_pass(uint16_t id, uint16_t mask);
+ 
+ #define WL_GCC_PA    0x00100000ull
+ #define WL_TLMM_PA   0x0f100000ull
+@@ -67,6 +72,8 @@
+ }
+ static inline void set(vm_offset_t b, uint32_t o, uint32_t bits) { wr(b, o, rd(b, o) | bits); }
+ static inline void clr(vm_offset_t b, uint32_t o, uint32_t bits) { wr(b, o, rd(b, o) & ~bits); }
++
++static int wf_boot(vm_offset_t mhi, uint32_t bhi);
+ 
+ static vm_offset_t
+ wl_map(uint64_t pa, uint64_t len)
+@@ -455,11 +462,203 @@
+ 		printf("PANDORA WLAN: BHI version %#x.%#x execution environment %#x status %#x error %#x %#x %#x\n",
+ 		    rd(mhi, bhi + 4), rd(mhi, bhi), rd(mhi, bhi + 0x28), rd(mhi, bhi + 0x2c), rd(mhi, bhi + 0x30),
+ 		    rd(mhi, bhi + 0x34), rd(mhi, bhi + 0x38));
++		if (rd(mhi, bhi + 0x28) == 0) {
++			int fe = wf_boot(mhi, bhi);
++			printf("PANDORA WLAN: firmware step -> %d\n", fe);
++		}
+ 	}
+ 	return 0;
+ }
++
++
++/*
++ * 0348: the firmware through MHI, as drivers/bus/mhi/host (boot.c, pm.c, init.c) with cnss2's settings for peach:
++ * fbc_download, sbl_size and seg_len 512 KiB, tme_supported_image (BHIe takes the file after the first 512 KiB).
++ * Polled: no MSI here. amss20.bin is read only from the firmware partition. This says whether the chip runs its
++ * firmware; WMI, the rings of the data path and the network interface are the next step (Ath12kWifi).
++ */
++#define WF_SEG   0x80000u
++#define WF_MAX   0x800000ull
++#define WF_NER   2u
++#define WF_ELS   256u
+ 
++static vm_offset_t
++wf_alloc(vm_size_t size, uint64_t *pa)
++{
++	vm_offset_t va = 0;
++	if (kmem_alloc_contig(kernel_map, &va, size, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return 0;
++	}
++	*pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)va));
++	return va;
++}
++
++static inline void
++wf_flush(uint64_t pa, uint64_t len)
++{
++	flush_dcache64((addr64_t)pa, (unsigned)len, TRUE);
++}
++
+ static void
++wf_state(vm_offset_t mhi, uint32_t bhi, const char *when)
++{
++	printf("PANDORA WLAN: %s: EE %#x BHI status %#x error %#x %#x, MHI control %#x status %#x\n", when,
++	    rd(mhi, bhi + 0x28), rd(mhi, bhi + 0x2c), rd(mhi, bhi + 0x30), rd(mhi, bhi + 0x34), rd(mhi, 0x38), rd(mhi, 0x48));
++}
++
++static int
++wf_boot(vm_offset_t mhi, uint32_t bhi)
++{
++	const uint32_t bhie = rd(mhi, 0x2c), chdb = rd(mhi, 0x18), erdb = rd(mhi, 0x20);
++	uint64_t fw_pa = 0, size = 0, ctx_pa = 0;
++	int e = pandora_smmu_pass(0x1400, 0x7f);
++	printf("PANDORA WLAN: SMMU -> %d; BDF to SID config %#x\n", e, rd(parf, 0x2c00));
++	if (e) {
++		return e;
++	}
++	set(dbi, WL_CFG_OFF + 0x04, 6u);        /* memory, bus master */
++	const vm_offset_t fw = wf_alloc(WF_MAX, &fw_pa);
++	/* One block: contexts, rings, vector table. */
++	const vm_offset_t ctx = wf_alloc(0x40000, &ctx_pa);
++	if (!fw || !ctx) {
++		return ENOMEM;
++	}
++	e = pandora_part_file("peach/amss20.bin", (void *)fw, WF_MAX, &size);
++	printf("PANDORA WLAN: amss20.bin -> %d, %llu bytes at %#llx\n", e, size, fw_pa);
++	if (e) {
++		return e;
++	}
++	if (size <= WF_SEG) {
++		return EINVAL;
++	}
++	wf_flush(fw_pa, size);
++	printf("PANDORA WLAN: serial %#x, %u segments wanted by the chip\n", rd(mhi, bhi + 0x40), rd(mhi, bhi + 0x48));
++
++	/* The vector table of what follows the first 512 KiB. */
++	struct { uint64_t pa, len; } *vec = (void *)(ctx + 0x30000);
++	unsigned nvec = 0;
++	for (uint64_t off = WF_SEG; off < size; off += WF_SEG, nvec++) {
++		vec[nvec].pa = fw_pa + off;
++		vec[nvec].len = MIN((uint64_t)WF_SEG, size - off);
++	}
++	wf_flush(ctx_pa + 0x30000, 0x1000);
++
++	/* mhi_async_power_up, mhi_fw_load_bhi */
++	wr(mhi, bhi + 0x20, 0);
++	wr(mhi, bhi + 0x2c, 0);
++	wr(mhi, bhi + 0x0c, (uint32_t)(fw_pa >> 32));
++	wr(mhi, bhi + 0x08, (uint32_t)fw_pa);
++	wr(mhi, bhi + 0x10, WF_SEG);
++	wr(mhi, bhi + 0x18, 0x1234567);
++	unsigned i;
++	uint32_t st = 0;
++	for (i = 0; i < 3000; i++) {
++		st = rd(mhi, bhi + 0x2c) >> 30;
++		if (st) {
++			break;
++		}
++		wl_sleep(10);
++	}
++	printf("PANDORA WLAN: BHI image: status %u after %u0 ms\n", st, i);
++	wf_state(mhi, bhi, "after BHI");
++	if (st != 2) {
++		return EIO;
++	}
++
++	/* mhi_ready_state_transition */
++	for (i = 0; i < 2000 && ((rd(mhi, 0x38) & 2u) || !(rd(mhi, 0x48) & 1u)); i++) {
++		wl_sleep(10);
++	}
++	wf_state(mhi, bhi, "READY wait");
++	if (!(rd(mhi, 0x48) & 1u)) {
++		return ETIMEDOUT;
++	}
++
++	/* mhi_init_dev_ctxt, mhi_init_mmio: no channel on, two event rings, the command ring. */
++	const uint64_t chan_pa = ctx_pa, er_pa = ctx_pa + 0x2000, cmd_pa = ctx_pa + 0x3000;
++	const uint64_t ring_pa = ctx_pa + 0x10000, cmdring_pa = ctx_pa + 0x20000, rlen = WF_ELS * 16u;
++	for (unsigned r = 0; r < WF_NER; r++) {
++		volatile uint32_t *c = (volatile uint32_t *)(ctx + 0x2000 + 44u * r);
++		const uint64_t base = ring_pa + r * 0x2000u;
++		c[1] = 1;                       /* MHI_ER_TYPE_VALID */
++		c[2] = r;
++		c[3] = (uint32_t)base; c[4] = (uint32_t)(base >> 32);
++		c[5] = (uint32_t)rlen; c[6] = 0;
++		c[7] = (uint32_t)base; c[8] = (uint32_t)(base >> 32);
++		const uint64_t wp = base + rlen - 16;
++		c[9] = (uint32_t)wp; c[10] = (uint32_t)(wp >> 32);
++	}
++	{
++		volatile uint32_t *c = (volatile uint32_t *)(ctx + 0x3000);
++		c[3] = (uint32_t)cmdring_pa; c[4] = (uint32_t)(cmdring_pa >> 32);
++		c[5] = (uint32_t)rlen; c[6] = 0;
++		c[7] = (uint32_t)cmdring_pa; c[8] = (uint32_t)(cmdring_pa >> 32);
++		c[9] = (uint32_t)cmdring_pa; c[10] = (uint32_t)(cmdring_pa >> 32);
++	}
++	wf_flush(ctx_pa, 0x40000);
++	wr(mhi, 0x10, (rd(mhi, 0x10) & 0x0000ffffu) | (WF_NER << 16));
++	wr(mhi, 0x5c, (uint32_t)(chan_pa >> 32)); wr(mhi, 0x58, (uint32_t)chan_pa);
++	wr(mhi, 0x64, (uint32_t)(er_pa >> 32)); wr(mhi, 0x60, (uint32_t)er_pa);
++	wr(mhi, 0x6c, (uint32_t)(cmd_pa >> 32)); wr(mhi, 0x68, (uint32_t)cmd_pa);
++	wr(mhi, 0x84, 0); wr(mhi, 0x80, 0);
++	wr(mhi, 0x9c, 0); wr(mhi, 0x98, 0);
++	wr(mhi, 0x8c, 0xf); wr(mhi, 0x88, 0xffffffffu);
++	wr(mhi, 0xa4, 0xf); wr(mhi, 0xa0, 0xffffffffu);
++	for (unsigned r = 0; r < WF_NER; r++) {
++		const uint64_t wp = ring_pa + r * 0x2000u + rlen - 16;
++		wr(mhi, erdb + 8 * r + 4, (uint32_t)(wp >> 32));
++		wr(mhi, erdb + 8 * r, (uint32_t)wp);
++	}
++	wr(mhi, 0x38, (rd(mhi, 0x38) & ~0xff00u) | (2u << 8));      /* M0 */
++	wr(mhi, chdb + 8 * 127 + 4, 0);                             /* MHI_DEV_WAKE_DB */
++	wr(mhi, chdb + 8 * 127, 1);
++	wf_state(mhi, bhi, "M0 asked");
++
++	/* SBL: then the rest of the image through BHIe (mhi_download_amss_image). */
++	uint32_t ee = 0;
++	for (i = 0; i < 1500; i++) {
++		ee = rd(mhi, bhi + 0x28);
++		if (ee || (rd(mhi, 0x48) & 4u)) {
++			break;
++		}
++		wl_sleep(10);
++	}
++	wf_state(mhi, bhi, "waiting for SBL");
++	if (rd(mhi, 0x48) & 4u) {
++		printf("PANDORA WLAN: SYSERR while starting\n");
++		return EIO;
++	}
++	wr(mhi, bhie + 0x30, (uint32_t)((ctx_pa + 0x30000) >> 32));
++	wr(mhi, bhie + 0x2c, (uint32_t)(ctx_pa + 0x30000));
++	wr(mhi, bhie + 0x34, nvec * 16u);
++	wr(mhi, bhie + 0x3c, 0x1234567);
++	for (i = 0; i < 3000; i++) {
++		st = rd(mhi, bhie + 0x44) >> 30;
++		if (st) {
++			break;
++		}
++		wl_sleep(10);
++	}
++	printf("PANDORA WLAN: BHIe: %u segments, status %u after %u0 ms\n", nvec, st, i);
++	for (unsigned t = 0; t < 30; t++) {
++		wl_sleep(1000);
++		ee = rd(mhi, bhi + 0x28);
++		wf_flush(ring_pa, 0x4000);
++		const volatile uint32_t *ev = (const volatile uint32_t *)(ctx + 0x10000);
++		printf("PANDORA WLAN: +%u s: EE %#x status %#x error %#x; first events %08x %08x %08x %08x | %08x %08x\n",
++		    t + 1, ee, rd(mhi, 0x48), rd(mhi, bhi + 0x30), ev[0], ev[1], ev[2], ev[3], ev[6], ev[7]);
++		if (ee == 2 || ee == 7 || (rd(mhi, 0x48) & 4u)) {
++			if (t < 25) {
++				t = 25;         /* a few more lines, then out */
++			}
++		}
++	}
++	wf_state(mhi, bhi, "at the end");
++	return ee == 2 ? 0 : EIO;
++}
++
++static void
+ wl_thread(void *arg, wait_result_t w)
+ {
+ 	(void)arg;

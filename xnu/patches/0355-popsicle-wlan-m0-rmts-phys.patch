@@ -1,0 +1,156 @@
+xnu 0355: Wi-Fi: wake doorbell after M0, Android's event rings, the SBL's log; modem file service: physical buffer addresses
+
+--- a/bsd/dev/pandora_adsp.c	2026-11-04 21:28:20
++++ b/bsd/dev/pandora_adsp.c	2026-11-04 21:28:20
+@@ -3468,17 +3468,19 @@
+ 			for (uint32_t i = 0; i < n && 1 + 12 * (i + 1) <= il; i++) {
+ 				uint32_t w[3];
+ 				memcpy(w, iv + 1 + 12 * i, 12);
++				/* 0355: phys_offset is the physical address in the buffer (t16: 0xe2000200). */
+ 				const uint64_t off = (uint64_t)w[0] * 512, sz = (uint64_t)w[2] * 512;
+-				if (off + sz > rfs_f[f].size || (uint64_t)w[1] + sz > RFS_BUF_SIZE) {
++				const uint64_t bo = (uint64_t)w[1] >= RFS_BUF_PA ? (uint64_t)w[1] - RFS_BUF_PA : (uint64_t)w[1];
++				if (off + sz > rfs_f[f].size || bo + sz > RFS_BUF_SIZE) {
+ 					printf("PANDORA MODEM: file service: vector outside: sector %u count %u buffer %#x\n", w[0], w[2], w[1]);
+ 					bad = true;
+ 					break;
+ 				}
+ 				if (dir[0]) {
+-					memcpy(rfs_f[f].mem + off, rfs_buf + w[1], (size_t)sz);       /* RAM only */
++					memcpy(rfs_f[f].mem + off, rfs_buf + bo, (size_t)sz);       /* RAM only */
+ 					ms_writes++;
+ 				} else {
+-					memcpy(rfs_buf + w[1], rfs_f[f].mem + off, (size_t)sz);
++					memcpy(rfs_buf + bo, rfs_f[f].mem + off, (size_t)sz);
+ 					ms_reads++;
+ 				}
+ 			}
+--- a/bsd/dev/pandora_wlan.c	2026-11-04 21:28:20
++++ b/bsd/dev/pandora_wlan.c	2026-11-04 21:28:20
+@@ -498,7 +498,7 @@
+ 		    rd(mhi, bhi + 0x34), rd(mhi, bhi + 0x38));
+ 		if (rd(mhi, bhi + 0x28) == 0) {
+ 			int fe = EIO;
+-			for (unsigned v = 0; v < 4 && fe; v++) {
++			for (unsigned v = 0; v < 1 && fe; v++) {        /* 0355: t16: MSI was it, the first try passed */
+ 				if (v && wf_again(v) != 0) {
+ 					fe = EIO;
+ 					continue;       /* no link this way: the next try still has its chance */
+@@ -522,7 +522,7 @@
+  */
+ #define WF_SEG   0x80000u
+ #define WF_MAX   0x800000ull
+-#define WF_NER   2u
++#define WF_NER   3u                     /* cnss_mhi_events without satellite: control, IPCR data, bandwidth */
+ #define WF_ELS   256u
+ 
+ /* 0349: below 4 GiB like Android's IOVAs (0xa0000000 on), non cached: low-bank RAM XNU does not use (Android's System RAM). */
+@@ -645,6 +645,46 @@
+ 	wr(bar, 0x3278, 0x40000000u | ((off >> 19) & 0x3fu));
+ 	(void)rd(bar, 0x3278);
+ 	return rd(bar, 0x80000u + (off & 0x7ffffu));
++}
++
++/* 0355: the second bootloader's own log: BHI ERRDBG2 start, ERRDBG3 size, in the chip's RAM (cnss_pci_dump_bl_sram_mem). */
++static void
++wf_sbl_log(vm_offset_t bar, uint32_t bhi)
++{
++	const uint32_t start = rd(bar, bhi + 0x38);
++	uint32_t size = rd(bar, bhi + 0x3c);
++	static char b[0x1001];
++	printf("PANDORA WLAN: SBL log at %#x, %u bytes\n", start, size);
++	if (start < 0x01400000u || start >= 0x01868000u || !size) {
++		return;
++	}
++	size = MIN(size, 0x1000u);
++	for (uint32_t i = 0; i < size; i += 4) {
++		const uint32_t v = wf_reg(bar, start + i);
++		memcpy(b + i, &v, 4);
++	}
++	b[size] = 0;
++	uint32_t o = 0;
++	while (o < size) {
++		uint32_t e = o;
++		while (e < size && b[e] != '\n' && b[e] != 0 && e - o < 160) {
++			e++;
++		}
++		if (e > o) {
++			const char c = b[e];
++			b[e] = 0;
++			bool text = true;
++			for (uint32_t k = o; k < e; k++) {
++				if ((unsigned char)b[k] < 0x20 && b[k] != '\r' && b[k] != '\t') {
++					text = false;
++				}
++			}
++			printf("PANDORA WLAN: SBL: %s\n", text ? b + o : "(binary)");
++			b[e] = c;
++		}
++		o = e + 1;
++	}
++	(void)pandora_log_sync();
+ }
+ 
+ static void
+@@ -764,7 +804,7 @@
+ 		volatile uint32_t *c = (volatile uint32_t *)(ctx + 0x2000 + 44u * r);
+ 		const uint64_t base = ring_pa + r * 0x2000u;
+ 		c[1] = 1;                       /* MHI_ER_TYPE_VALID */
+-		c[2] = r;
++		c[2] = r == 1 ? 2 : 1;          /* cnss_mhi_events .irq: 1, 2, 1 */
+ 		c[3] = (uint32_t)base; c[4] = (uint32_t)(base >> 32);
+ 		c[5] = (uint32_t)rlen; c[6] = 0;
+ 		c[7] = (uint32_t)base; c[8] = (uint32_t)(base >> 32);
+@@ -785,18 +825,32 @@
+ 	wr(mhi, 0x6c, (uint32_t)(cmd_pa >> 32)); wr(mhi, 0x68, (uint32_t)cmd_pa);
+ 	wr(mhi, 0x84, 0); wr(mhi, 0x80, 0);
+ 	wr(mhi, 0x9c, 0); wr(mhi, 0x98, 0);
+-	wr(mhi, 0x8c, 0xf); wr(mhi, 0x88, 0xffffffffu);
+-	wr(mhi, 0xa4, 0xf); wr(mhi, 0xa0, 0xffffffffu);
++	wr(mhi, 0x8c, 0); wr(mhi, 0x88, 0xffffffffu);
++	wr(mhi, 0xa4, 0); wr(mhi, 0xa0, 0xffffffffu);
+ 	for (unsigned r = 0; r < WF_NER; r++) {
+ 		const uint64_t wp = ring_pa + r * 0x2000u + rlen - 16;
+ 		wr(mhi, erdb + 8 * r + 4, (uint32_t)(wp >> 32));
+ 		wr(mhi, erdb + 8 * r, (uint32_t)wp);
+ 	}
+ 	wr(mhi, 0x38, (rd(mhi, 0x38) & ~0xff00u) | (2u << 8));      /* M0 */
+-	wr(mhi, chdb + 8 * 127 + 4, 0);                             /* MHI_DEV_WAKE_DB */
+-	wr(mhi, chdb + 8 * 127, 1);
+ 	wf_state(mhi, bhi, "M0 asked");
+ 	(void)pandora_log_sync();
++	/* 0355: the wake doorbell after the chip says M0, as mhi_pm_m0_transition (t16: SYS_ERR right after both at once). */
++	for (i = 0; i < 200; i++) {
++		const uint32_t ms = rd(mhi, 0x48);
++		if (((ms >> 8) & 0xff) == 2 || (ms & 4u)) {
++			break;
++		}
++		wl_sleep(5);
++	}
++	wf_state(mhi, bhi, "M0 wait");
++	if (rd(mhi, 0x48) & 4u) {
++		wf_sbl_log(mhi, bhi);
++		printf("PANDORA WLAN: SYSERR entering M0\n");
++		return EIO;
++	}
++	wr(mhi, chdb + 8 * 127 + 4, 0);                             /* MHI_DEV_WAKE_DB */
++	wr(mhi, chdb + 8 * 127, 1);
+ 
+ 	/* SBL: then the rest of the image through BHIe (mhi_download_amss_image). */
+ 	uint32_t ee = 0;
+@@ -809,6 +863,7 @@
+ 	}
+ 	wf_state(mhi, bhi, "waiting for SBL");
+ 	if (rd(mhi, 0x48) & 4u) {
++		wf_sbl_log(mhi, bhi);
+ 		printf("PANDORA WLAN: SYSERR while starting\n");
+ 		return EIO;
+ 	}
+@@ -839,6 +894,7 @@
+ 		}
+ 	}
+ 	wf_state(mhi, bhi, "at the end");
++	wf_sbl_log(mhi, bhi);
+ 	(void)pandora_smmu_report("at the end");
+ 	return ee == 2 ? 0 : EIO;
+ }

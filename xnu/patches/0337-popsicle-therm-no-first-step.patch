@@ -1,0 +1,18 @@
+diff --git a/bsd/dev/pandora_therm.c b/bsd/dev/pandora_therm.c
+--- a/bsd/dev/pandora_therm.c
++++ b/bsd/dev/pandora_therm.c
+@@ -618,7 +618,13 @@
+ 			relax = r > 0 && r <= 10 ? r * 1000 : 0;
+ 			printf("PANDORA THERM: body limits %d C later\n", relax / 1000);
+ 		}
+-		const bool moved = pt_level >= 2 && measured && gauge && pt_limit(body - relax);
++		/* popsicle: relaxed, nothing is capped under the table's second step (35 C after the shift): its first step caps
++		 * the clusters from 25 C, far under what this chassis reaches at rest. */
++		int32_t lim = body - relax;
++		if (relax && lim < 35000) {
++			lim = 20000;
++		}
++		const bool moved = pt_level >= 2 && measured && gauge && pt_limit(lim);
+ 		pt_hid_update(in, vs, measured && gauge);
+ 		if (moved) {
+ 			char b[12];

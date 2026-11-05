@@ -1,0 +1,77 @@
+xnu 0364: Wi-Fi board: a watch thread over the driver, a sleep test on its stack
+
+--- a/bsd/dev/pandora_wlan.c	2026-11-04 23:36:34
++++ b/bsd/dev/pandora_wlan.c	2026-11-04 23:43:00
+@@ -90,6 +90,16 @@
+ wl_map(uint64_t pa, uint64_t len)
+ {
+ 	return ml_io_map_unmappable((vm_offset_t)pa, (vm_size_t)((len + 0xfff) & ~0xfffull), VM_WIMG_IO);
++}
++
++static int wl_chan_w;
++static void
++wl_sleep_w(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&wl_chan_w, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
+ }
+ 
+ static void
+@@ -1125,7 +1135,8 @@
+ 
+ static uint64_t nw_now_ns(void) { uint64_t n; absolutetime_to_nanoseconds(mach_absolute_time(), &n); return n; }
+ static uint64_t nw_now_ms(void) { return nw_now_ns() / 1000000; }
+-static void nw_sleep_ms(unsigned ms) { wl_sleep(ms ? ms : 1); }
++static uint64_t nw_sleeps;
++static void nw_sleep_ms(unsigned ms) { nw_sleeps++; wl_sleep(ms ? ms : 1); }
+ static void nw_poll(void) { }
+ static void nw_log(int level, const char *line)
+ {
+@@ -1296,11 +1307,32 @@
+ extern int nw_wifi_control_transport_set(const struct nw_control_transport *transport);
+ static int nw_ct_send(void *c, uint64_t s, const void *b, size_t l) { (void)c; (void)s; (void)b; (void)l; return 2; }
+ static void nw_ct_wake(void *c) { (void)c; }
++
++/* 0364: where the driver stands, from another thread: kind (1 irq, 2 timer, 3 work, 4 poll), function, depth, its ms. */
++static void
++nw_watch(void *arg, wait_result_t w)
++{
++	(void)arg;
++	(void)w;
++	static int ticks;
++	for (;;) {
++		wl_sleep_w(3000);
++		printf("PANDORA NW watch: kind %llu fn+%#llx depth %llu at %llu ms (now %llu); %llu sleeps; stats stage %u err %d\n", nw_wifi_where[0], nw_wifi_where[1], nw_wifi_where[2],
++		    nw_wifi_where[3], nw_now_ms(), nw_sleeps, nw_wifi_stats.stage, nw_wifi_stats.last_err);
++		if (ticks++ % 3 == 0) {
++			(void)pandora_log_sync();
++		}
++	}
++}
+ 
+ static void
+ nw_run(void)
+ {
+ 	static const struct nw_control_transport ct = {.send = nw_ct_send, .wake = nw_ct_wake};
++	printf("PANDORA NW: on its own stack: %p\n", __builtin_frame_address(0));
++	wl_sleep(5);
++	printf("PANDORA NW: a sleep on this stack came back\n");
++	(void)pandora_log_sync();
+ 	int cr = nw_wifi_control_transport_set(&ct);
+ 	printf("PANDORA NW: control transport -> %d\n", cr);
+ 	nw_wifi_set_events(&nw_events_set);
+@@ -1429,6 +1461,12 @@
+ 	set(dbi, WL_CFG_OFF + 0x04, 6u);        /* memory, bus master */
+ 	printf("PANDORA NW: PCIe capability %#x MSI %#x; starting the driver\n", nw_pcie_cap, nw_the_board.msi_cap);
+ 	(void)pandora_log_sync();
++	{
++		thread_t t;
++		if (kernel_thread_start(nw_watch, NULL, &t) == KERN_SUCCESS) {
++			thread_deallocate(t);
++		}
++	}
+ 	nw_on_stack();
+ 	return 0;
+ }

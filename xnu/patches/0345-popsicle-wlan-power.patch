@@ -1,0 +1,130 @@
+xnu 0345: Wi-Fi power-on as cnss2: rail order, rf_clk, host SOL low, reference clock; log the chip lines
+
+--- a/bsd/dev/pandora_adsp.c	2026-11-04 18:00:07
++++ b/bsd/dev/pandora_adsp.c	2026-11-04 18:00:07
+@@ -416,6 +416,22 @@
+ 
+ /* One VRM (rpmh-regulator order: voltage, mode, enable) for bsd/dev/pandora_wlan.c. mode < 0 leaves it alone. */
+ int pandora_rpmh_vrm(const char *res, uint32_t mv, int mode);
++int pandora_rpmh_clk(const char *res);
++
++/* clk-rpmh.c, DEFINE_CLK_RPMH_VRM: the enable word of an RPMh clock resource (rfclka1 etc.). */
++int
++pandora_rpmh_clk(const char *res)
++{
++	uint32_t addr, aux, len;
++	if (!ad_rsc) {
++		ad_rsc = ad_map(AD_RSC_PA, 0x10000, VM_WIMG_IO);
++	}
++	if (!ad_db) {
++		ad_db = ad_map(AD_CMDDB_PA, AD_CMDDB_SIZE, VM_WIMG_IO);
++	}
++	int e = cmddb_find(res, &addr, &aux, &len);
++	return e ? e : rpmh_write1(addr + 4, 1);
++}
+ 
+ int
+ pandora_rpmh_vrm(const char *res, uint32_t mv, int mode)
+--- a/bsd/dev/pandora_wlan.c	2026-11-04 18:00:07
++++ b/bsd/dev/pandora_wlan.c	2026-11-04 18:00:07
+@@ -27,6 +27,7 @@
+ extern kern_return_t thread_terminate(thread_t);
+ extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);
+ extern int pandora_rpmh_vrm(const char *res, uint32_t mv, int mode);
++extern int pandora_rpmh_clk(const char *res);
+ 
+ #define WL_GCC_PA    0x00100000ull
+ #define WL_TLMM_PA   0x0f100000ull
+@@ -46,6 +47,11 @@
+ #define GPIO_PERST   102u
+ #define GPIO_CLKREQ  103u
+ #define GPIO_WAKE    104u
++#define GPIO_SW_CTRL 18u                /* the chip drives these two once its PMU runs */
++#define GPIO_WL_SW_CTRL 19u
++#define GPIO_HOST_SOL 204u
++#define GPIO_DEV_SOL 205u
++#define WL_TCSR_PA   0x01fd5000ull      /* tcsr_pcie_0_clkref_en at 0x1fd5044, bit 0 */
+ 
+ #define PERF_LVL_GEN3 4u                /* PERF_LVL_GEN1 is 2 in msm_pcie_cesta_perf_idx */
+ #define WLAN_ID      0x110e17cbu
+@@ -89,6 +95,19 @@
+ 	printf("PANDORA WLAN: GPIO %u control %#x (reads %#x) io %#x\n", pin, ctl, rd(t, 0), rd(t, 4));
+ }
+ 
++/* 0345: whether the chip shows life: its two SW_CTRL lines and its sign-of-life line. */
++static void
++wl_pins(const char *when)
++{
++	static const unsigned pins[] = {GPIO_SW_CTRL, GPIO_WL_SW_CTRL, GPIO_DEV_SOL, GPIO_WLAN_EN};
++	uint32_t v[4];
++	for (unsigned i = 0; i < 4; i++) {
++		vm_offset_t t = wl_map(WL_TLMM_PA + pins[i] * 0x1000ull, 0x1000);
++		v[i] = rd(t, 4) & 1u;
++	}
++	printf("PANDORA WLAN: %s: SW_CTRL %u WLAN_SW_CTRL %u DEV_SOL %u WLAN_EN %u\n", when, v[0], v[1], v[2], v[3]);
++}
++
+ /* The WCN rails in the device tree's order for the node (properties are stored last first). */
+ static int
+ wl_rails(void)
+@@ -98,13 +117,14 @@
+ 		uint32_t mv;
+ 		int mode;       /* 7: LDO high power, for what Android gives a load; -1: left alone */
+ 	} rails[] = {
+-		{"L2G_E0", 1800, 7},
++		/* 0345: cnss2's cnss_vreg_list order: io12, ant-share, aon, dig, rfa1, rfa2, cx */
+ 		{"L3G_E0", 1200, 7},
+-		{"S1J_E1", 892, -1},
++		{"L3K_E1", 1200, 7},
++		{"L2G_E0", 1800, 7},
+ 		{"S2J_E1", 892, -1},
+ 		{"S8F_E0", 1800, -1},
+ 		{"S7F_E0", 1224, -1},
+-		{"L3K_E1", 1200, 7},
++		{"S1J_E1", 892, -1},
+ 	};
+ 	for (unsigned i = 0; i < sizeof(rails) / sizeof(rails[0]); i++) {
+ 		int e = pandora_rpmh_vrm(rails[i].res, rails[i].mv, rails[i].mode);
+@@ -210,8 +230,17 @@
+ 		return e;
+ 	}
+ 	wl_sleep(5);
++	/* 0345: cnss_power_on_device_host: vregs, rf_clk (c1a_e0, "rfclka1" in cmd-db), wlan_en, then host SOL low.
++	 * t8: LTSSM stayed in Detect, nothing on the other side. */
++	wl_pins("before");
++	printf("PANDORA WLAN: rf_clk C1A_E0 -> %d\n", pandora_rpmh_clk("C1A_E0"));
++	delay(100);
+ 	wl_gpio(GPIO_WLAN_EN, 0x200u | (7u << 6) | 3u, 1);
+-	wl_sleep(100);
++	wl_gpio(GPIO_HOST_SOL, 0x200u, 0);
++	wl_sleep(10);
++	wl_pins("WLAN_EN +10 ms");
++	wl_sleep(90);
++	wl_pins("WLAN_EN +100 ms");
+ 
+ 	/* gcc-canoe.c keeps these two on at probe: gcc_pcie_rscc_cfg_ahb_clk, gcc_pcie_rscc_xo_clk. */
+ 	set(gcc, 0x52010, (1u << 20) | (1u << 21));
+@@ -316,6 +345,15 @@
+ 	set(parf, 0x2c4, 1u << 8);
+ 	set(dbi, 0x714, 1u << 5);
+ 
++	{
++		vm_offset_t tc = wl_map(WL_TCSR_PA, 0x1000);
++		if (tc) {
++			printf("PANDORA WLAN: PCIe reference clock enable was %#x\n", rd(tc, 0x44));
++			wr(tc, 0x44, rd(tc, 0x44) | 1u);
++		}
++	}
++	delay(100);
++	wl_pins("before PERST release");
+ 	wl_gpio(GPIO_PERST, 0x200u | 1u, 1);    /* out of reset */
+ 	wl_sleep(5);
+ 
+@@ -334,6 +372,7 @@
+ 		}
+ 		wl_sleep(1);
+ 	}
++	wl_pins("after the wait for the link");
+ 	printf("PANDORA WLAN: after %u ms ELBI status %#x (LTSSM %u) link %#x, states seen %#llx\n",
+ 	    i, st, (st >> 12) & 0x3f, lnk, seen);
+ 	if (!(st & 0x400u) || !(lnk & (1u << 29))) {

@@ -1,0 +1,35 @@
+xnu 0367: Wi-Fi: the AOP votes Android sends for the chip rail
+
+--- a/bsd/dev/pandora_wlan.c
++++ b/bsd/dev/pandora_wlan.c
+@@ -1421,6 +1421,13 @@
+ static int
+ nw_go(vm_offset_t mhi)
+ {
++	{
++		/* cnss_aop_update_mode: Android's votes for the chip's rail, from qcom,pdc_mode_vote_table */
++		extern int pandora_qmp_send(const char *msg);
++		int v1 = pandora_qmp_send("{class: wlan_pdc, ss: rf, res: L3K1.m, enable: 1}");
++		int v2 = pandora_qmp_send("{class: wlan_pdc, ss: rf, res: L3K1.m, dwnval: 2}");
++		printf("PANDORA NW: AOP votes -> %d %d\n", v1, v2);
++	}
+ 	int e = pandora_smmu_pass(0x1400, 0x7f);
+ 	printf("PANDORA NW: SMMU -> %d\n", e);
+ 	if (e) {
+--- a/bsd/dev/pandora_adsp.c
++++ b/bsd/dev/pandora_adsp.c
+@@ -319,6 +319,14 @@
+ 		return ETIMEDOUT;
+ 	}
+ 	return 0;
++}
++
++/* For the Wi-Fi bring-up (cnss_aop_update_mode). */
++int pandora_qmp_send(const char *msg);
++int
++pandora_qmp_send(const char *msg)
++{
++	return qmp_send(msg);
+ }
+ 
+ /* ---- RPMh ARC level vote (apps RSC DRV 2, v3 layout, cmd-db) ---------------------- */

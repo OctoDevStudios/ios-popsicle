@@ -1,0 +1,35 @@
+diff --git a/bsd/dev/pandora_therm.c b/bsd/dev/pandora_therm.c
+--- a/bsd/dev/pandora_therm.c
++++ b/bsd/dev/pandora_therm.c
+@@ -575,6 +575,31 @@
+ 		for (unsigned k = 0; k < 7; k++) {
+ 			in[k] = pt_in[k] < 0 ? battery : t[pt_in[k]];
+ 		}
++		/* popsicle (17 Pro Max): some of the 17 Pro's thermistors read as open (130 C) on this board; one such input
++		 * made the body formula 120 C and capped everything. An input outside -20..110 C is replaced by the mean of
++		 * the valid ones (the gauge's when none is). */
++		{
++			int64_t vsum = 0;
++			unsigned nv = 0, bad = 0;
++			for (unsigned k = 0; k < 7; k++) {
++				if (in[k] > -20000 && in[k] < 110000) {
++					vsum += in[k];
++					nv++;
++				}
++			}
++			const int32_t sub = nv ? (int32_t)(vsum / nv) : battery;
++			for (unsigned k = 0; k < 7; k++) {
++				if (!(in[k] > -20000 && in[k] < 110000)) {
++					in[k] = sub;
++					bad++;
++				}
++			}
++			static bool told;
++			if (bad && !told) {
++				told = true;
++				printf("PANDORA THERM: popsicle: %u of 7 body inputs out of range, replaced by %d mC\n", bad, sub);
++			}
++		}
+ 		for (unsigned v = 0; v < PT_VS; v++) {
+ 			int64_t sum = 0;
+ 			for (unsigned k = 0; k < 7; k++) {

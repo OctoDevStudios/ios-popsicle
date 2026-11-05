@@ -1,0 +1,101 @@
+xnu 0346: Wi-Fi: second link try with a power cycle; BAR0 and the chip MHI state
+
+--- a/bsd/dev/pandora_wlan.c	2026-11-04 18:04:47
++++ b/bsd/dev/pandora_wlan.c	2026-11-04 18:04:47
+@@ -359,23 +359,40 @@
+ 
+ 	wr(dbi, 0x80c, (rd(dbi, 0x80c) & ~0x1f00u) | (1u << 8));
+ 	wr(dbi, 0x70 + 0x30, (rd(dbi, 0x70 + 0x30) & ~0xfu) | 3u);      /* qcom,target-link-speed */
+-	set(parf, 0x1b0, 1u << 8);              /* LTSSM on */
+-
++	/* 0346: a second try with a full power cycle of the chip and more time, so one boot says more. */
+ 	uint64_t seen = 0;
+ 	uint32_t st = 0, lnk = 0;
+-	for (i = 0; i < 1000; i++) {
+-		st = rd(dbi, WL_ELBI_OFF + 8);
+-		lnk = rd(dbi, 0x70 + 0x10);
+-		seen |= 1ull << ((st >> 12) & 0x3f);
+-		if ((st & 0x400u) && (lnk & (1u << 29))) {
+-			break;
++	bool up = false;
++	for (unsigned attempt = 0; attempt < 2 && !up; attempt++) {
++		if (attempt) {
++			clr(parf, 0x1b0, 1u << 8);
++			wl_gpio(GPIO_PERST, 0x200u | 1u, 0);
++			wl_gpio(GPIO_WLAN_EN, 0x200u | (7u << 6) | 3u, 0);
++			wl_sleep(100);
++			wl_pins("chip off");
++			wl_gpio(GPIO_WLAN_EN, 0x200u | (7u << 6) | 3u, 1);
++			wl_sleep(500);
++			wl_pins("chip on +500 ms");
++			wl_gpio(GPIO_PERST, 0x200u | 1u, 1);
++			wl_sleep(100);
+ 		}
+-		wl_sleep(1);
++		seen = 0;
++		set(parf, 0x1b0, 1u << 8);              /* LTSSM on */
++		for (i = 0; i < 1000; i++) {
++			st = rd(dbi, WL_ELBI_OFF + 8);
++			lnk = rd(dbi, 0x70 + 0x10);
++			seen |= 1ull << ((st >> 12) & 0x3f);
++			if ((st & 0x400u) && (lnk & (1u << 29))) {
++				up = true;
++				break;
++			}
++			wl_sleep(1);
++		}
++		wl_pins("after the wait for the link");
++		printf("PANDORA WLAN: try %u: after %u ms ELBI status %#x (LTSSM %u) link %#x, states seen %#llx, PHY %#x\n",
++		    attempt, i, st, (st >> 12) & 0x3f, lnk, seen, rd(phy, 0x414));
+ 	}
+-	wl_pins("after the wait for the link");
+-	printf("PANDORA WLAN: after %u ms ELBI status %#x (LTSSM %u) link %#x, states seen %#llx\n",
+-	    i, st, (st >> 12) & 0x3f, lnk, seen);
+-	if (!(st & 0x400u) || !(lnk & (1u << 29))) {
++	if (!up) {
+ 		printf("PANDORA WLAN: no link\n");
+ 		return ETIMEDOUT;
+ 	}
+@@ -405,7 +422,41 @@
+ 	for (i = 0; i < 6; i++) {
+ 		printf("PANDORA WLAN: BAR%u %#x\n", i, rd(dbi, WL_CFG_OFF + 0x10 + 4 * i));
+ 	}
+-	return id == WLAN_ID ? 0 : EIO;
++	if (id != WLAN_ID) {
++		return EIO;
++	}
++	/* 0346: BAR0 where Android has it, through an outbound memory window (DT ranges 0x40300000, 0x3d00000), and the
++	 * chip's own state: read only, no firmware yet. */
++	wr(atu, 0x204, 0);
++	wr(atu, 0x200, 0);                      /* MEM */
++	wr(atu, 0x208, 0x40300000u);
++	wr(atu, 0x20c, 0);
++	wr(atu, 0x210, 0x43ffffffu);
++	wr(atu, 0x214, 0x40300000u);
++	wr(atu, 0x218, 0);
++	wr(atu, 0x204, 1u << 31);
++	delay(100);
++	wr(dbi, 0x20, 0x43f04030u);             /* the bridge's memory window */
++	set(dbi, 0x04, 6u);                     /* root port: memory, bus master */
++	wr(dbi, WL_CFG_OFF + 0x10, 0x40400000u);
++	wr(dbi, WL_CFG_OFF + 0x14, 0);
++	set(dbi, WL_CFG_OFF + 0x04, 2u);        /* endpoint: memory */
++	delay(100);
++	printf("PANDORA WLAN: BAR0 now %#x, command %#x\n", rd(dbi, WL_CFG_OFF + 0x10), rd(dbi, WL_CFG_OFF + 4));
++	vm_offset_t mhi = wl_map(0x40400000ull, 0x2000);
++	if (!mhi) {
++		return ENOMEM;
++	}
++	const uint32_t bhi = rd(mhi, 0x28);
++	printf("PANDORA WLAN: MHI length %#x version %#x cfg %#x channel doorbells %#x event doorbells %#x BHI %#x BHIe %#x\n",
++	    rd(mhi, 0), rd(mhi, 8), rd(mhi, 0x10), rd(mhi, 0x18), rd(mhi, 0x20), bhi, rd(mhi, 0x2c));
++	printf("PANDORA WLAN: MHI control %#x status %#x\n", rd(mhi, 0x38), rd(mhi, 0x48));
++	if (bhi && bhi < 0x1f00) {
++		printf("PANDORA WLAN: BHI version %#x.%#x execution environment %#x status %#x error %#x %#x %#x\n",
++		    rd(mhi, bhi + 4), rd(mhi, bhi), rd(mhi, bhi + 0x28), rd(mhi, bhi + 0x2c), rd(mhi, bhi + 0x30),
++		    rd(mhi, bhi + 0x34), rd(mhi, bhi + 0x38));
++	}
++	return 0;
+ }
+ 
+ static void

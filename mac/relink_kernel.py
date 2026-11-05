@@ -1,0 +1,53 @@
+#!/usr/bin/python3 -I
+"""Relink a PANDORA kernel on this Mac from a CI run's objects, with another Wi-Fi driver object (no C compile).
+
+  mac/relink_kernel.py WORK NW_ALL_O OUT
+
+WORK: xnu-objects artifact unpacked (obj/, linklibs/) and ci.log (`gh run view ID --log`).
+Writes OUT/kernel.development.pandora (stripped) and OUT/kernel.development.pandora.unstripped.
+"""
+import os, re, shlex, subprocess, sys
+work, nw, out = (os.path.abspath(os.path.expanduser(a)) for a in sys.argv[1:4])
+os.makedirs(out, exist_ok=True)
+cfg = os.path.join(work, 'obj/DEVELOPMENT_ARM64_PANDORA')
+line = next(l for l in open(os.path.join(work, 'ci.log'), errors='replace')
+            if 'clang++ ' in l and 'kernel.development.pandora.unstripped' in l and '-filelist' in l)
+cmd = line[line.index('/Applications/Xcode'):].strip()
+cmd = re.sub(r'\x1b\[[0-9;]*m', '', cmd)
+args = shlex.split(cmd)
+RUN = '/Users/runner/work/popsicle-ios/popsicle-ios/dxb/build/xnu.obj/DEVELOPMENT_ARM64_PANDORA'
+sdk = subprocess.run(['xcrun', '--sdk', 'macosx', '--show-sdk-path'], capture_output=True, text=True).stdout.strip()
+libs = os.path.join(work, 'linklibs')
+cc = os.path.join(libs, 'libcc_kext.a')
+if not os.path.exists(cc):
+    os.symlink('libclang_rt.cc_kext.a', cc)
+fl = os.path.join(out, 'link.filelist')
+with open(fl, 'w') as f:
+    for p in open(os.path.join(cfg, 'link.filelist')):
+        f.write(p.strip().replace(RUN, cfg) + '\n')
+new = ['xcrun', 'clang++']
+i = 1
+while i < len(args):
+    a = args[i]
+    if a == '-filelist':
+        new += ['-filelist', fl]; i += 2; continue
+    if a == '-o':
+        new += ['-o', os.path.join(out, 'kernel.development.pandora.unstripped')]; i += 2; continue
+    if a == '-isysroot':
+        new += ['-isysroot', sdk]; i += 2; continue
+    if a.endswith('/bsd/dev/nw_all.o'):
+        new.append(nw); i += 1; continue
+    if a.startswith('-L') and 'fakeroot' in a:
+        new.append('-L' + libs); i += 1; continue
+    new.append(a.replace(RUN, cfg))
+    i += 1
+new += ['-L' + libs]
+print(' '.join(new)[:300], '...')
+r = subprocess.run(new, cwd=cfg, capture_output=True, text=True)
+print(r.stderr[-3000:])
+if r.returncode:
+    sys.exit('link failed')
+u = os.path.join(out, 'kernel.development.pandora.unstripped')
+k = os.path.join(out, 'kernel.development.pandora')
+subprocess.run(['xcrun', 'strip', '-S', '-o', k, u], check=True)
+print(os.path.getsize(k), 'bytes')

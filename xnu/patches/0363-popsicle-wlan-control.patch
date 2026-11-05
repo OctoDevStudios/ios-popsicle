@@ -1,0 +1,27 @@
+xnu 0363: Wi-Fi board: an empty control transport so the driver starts
+
+--- a/bsd/dev/pandora_wlan.c	2026-11-04 23:23:18
++++ b/bsd/dev/pandora_wlan.c	2026-11-04 23:23:18
+@@ -1287,9 +1287,22 @@
+ static struct nw_board nw_the_board;
+ static const struct nw_wifi_events nw_events_set = {.scan_done = nw_ev_scan, .connect_done = nw_ev_connect, .link_lost = nw_ev_lost};
+ 
++/* include/nw_control_endpoint.h: the channel of wpa_supplicant; none yet, only so the driver starts (cfg80211's nl80211_init binds it). */
++struct nw_control_transport {
++	void *context;
++	int (*send)(void *context, uint64_t session, const void *bytes, size_t length);
++	void (*wake)(void *context);
++};
++extern int nw_wifi_control_transport_set(const struct nw_control_transport *transport);
++static int nw_ct_send(void *c, uint64_t s, const void *b, size_t l) { (void)c; (void)s; (void)b; (void)l; return 2; }
++static void nw_ct_wake(void *c) { (void)c; }
++
+ static void
+ nw_run(void)
+ {
++	static const struct nw_control_transport ct = {.send = nw_ct_send, .wake = nw_ct_wake};
++	int cr = nw_wifi_control_transport_set(&ct);
++	printf("PANDORA NW: control transport -> %d\n", cr);
+ 	nw_wifi_set_events(&nw_events_set);
+ 	nw_wifi_irq_mode(0);
+ 	int r = nw_wifi_start(&nw_platform, &nw_the_board);

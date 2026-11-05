@@ -1,0 +1,407 @@
+xnu 0353: Wi-Fi rails at Android's power-on voltages, back to the healthy DMA region; modem file service, read only, writes kept in RAM
+
+--- a/bsd/dev/pandora_adsp.c	2026-11-04 20:58:11
++++ b/bsd/dev/pandora_adsp.c	2026-11-04 20:58:11
+@@ -3101,6 +3101,7 @@
+ static QcomGlinkChannel *ms_ch;
+ static void ms_state(void *ctx, QcomGlinkChannel *ch, int up);
+ static void ms_receive(void *ctx, QcomGlinkChannel *ch, const uint8_t *d, uint32_t len);
++static void ms_tx_step(void);
+ 
+ /*
+  * Boot-args: pandora_adsp (1 TrustZone queries, 2 also start the DSP pandora_adsp_delay s after
+@@ -3171,6 +3172,7 @@
+ 			clock_interval_to_deadline(30000, NSEC_PER_MSEC, &fast_until);
+ 		}
+ 		ipcc_poll();
++		ms_tx_step();
+ 		if (ms_gl_wanted) {
+ 			static const QcomGlinkClient ms_client = {ms_state, ms_receive};
+ 			ms_gl_wanted = false;
+@@ -3303,8 +3305,254 @@
+  */
+ /* 0349: IPCRTR on the modem's link, read only so far: who it serves and whom it asks for. qrtr_hdr_v1 in af_qrtr.c. */
+ static unsigned ms_rx_shown;
++
++/*
++ * 0353: the modem's file service, as linux-msm/rmtfs (service 14, version 1, instance 0; qmi_rmtfs.qmi) and Android's
++ * rmt_storage. READ ONLY for the phone: a partition is copied to RAM when opened (modemst1, modemst2, fsc, fsg), the
++ * modem's writes change that RAM only, gone at the next boot. There is no write path to the storage here.
++ * The buffer as qcom,rmtfs_sharedmem@0 (4 MiB, client 1), shared with the modem's VM. Low-bank RAM XNU does not use.
++ */
++static int mss_assign(uint64_t pa, uint64_t size, bool shared);
++#define RFS_BUF_PA    0xe2000000ull
++#define RFS_BUF_SIZE  0x400000u
++#define RFS_FILE_PA   0xe3000000ull     /* 8 MiB per file */
++#define RFS_FILE_SIZE 0x800000u
++#define RFS_PORT      0x4000u
++#define MS_MSG_MAX    4096u
++#define MS_RING       8u
++extern int pandora_part_find(const char *name, uint32_t *lun, uint64_t *first, uint64_t *blocks);
++extern int pandora_part_pread(uint64_t off, void *dst, uint64_t len);
++
++static const struct {
++	const char *path, *part;
++} rfs_files[4] = {{"/boot/modem_fs1", "modemst1"}, {"/boot/modem_fs2", "modemst2"}, {"/boot/modem_fsc", "fsc"}, {"/boot/modem_fsg", "fsg"}};
++static struct {
++	uint8_t *mem;
++	uint64_t size;
++	bool open;
++} rfs_f[4];
++static uint8_t *rfs_buf;
++static struct { uint32_t len; uint8_t d[MS_MSG_MAX]; } ms_in[MS_RING], ms_out[MS_RING];
++static volatile uint32_t ms_in_w, ms_in_r, ms_out_w, ms_out_r;
++static uint32_t ms_modem_node, ms_writes, ms_reads;
++
++static void
++ms_ctrl_send(QcomGlinkChannel *ch, uint32_t node, uint32_t port, const uint32_t *words, unsigned n)
++{
++	uint32_t pkt[8 + 8] = {1, 2, 1, 0xfffffffeu, 0, 20, node, port};
++	pkt[1] = words[0] == 7 ? 7 : words[0];
++	for (unsigned i = 0; i < n && i < 5; i++) {
++		pkt[8 + i] = words[i];
++	}
++	int e = qcom_glink_send(&ed_modem.gl, ch, pkt, 52);
++	if (e) {
++		printf("PANDORA MODEM: control %u not sent: %d\n", words[0], e);
++	}
++}
++
++static void
++rfs_reply(const uint8_t *req, uint16_t msg, const uint8_t *tlv, uint32_t tlv_len)
++{
++	if ((ms_out_w - ms_out_r) >= MS_RING) {
++		printf("PANDORA MODEM: file service reply lost\n");
++		return;
++	}
++	uint8_t *o = ms_out[ms_out_w % MS_RING].d;
++	uint32_t hdr[8];
++	memcpy(hdr, req, 32);
++	const uint32_t size = 7 + tlv_len;
++	const uint32_t out[8] = {1, 1, 1, RFS_PORT, 0, size, hdr[2], hdr[3]};
++	memcpy(o, out, 32);
++	o[32] = 2;                              /* QMI response */
++	o[33] = req[33];
++	o[34] = req[34];                        /* the transaction */
++	o[35] = (uint8_t)msg;
++	o[36] = (uint8_t)(msg >> 8);
++	o[37] = (uint8_t)tlv_len;
++	o[38] = (uint8_t)(tlv_len >> 8);
++	memcpy(o + 39, tlv, tlv_len);
++	ms_out[ms_out_w % MS_RING].len = 32 + ((size + 3) & ~3u);
++	__atomic_fetch_add(&ms_out_w, 1, __ATOMIC_RELEASE);
++}
++
++/* TLV type t of a QMI message, its length through *len. */
++static const uint8_t *
++rfs_tlv(const uint8_t *p, uint32_t n, uint8_t t, uint32_t *len)
++{
++	for (uint32_t o = 0; o + 3 <= n;) {
++		const uint32_t l = p[o + 1] | (uint32_t)p[o + 2] << 8;
++		if (o + 3 + l > n) {
++			return NULL;
++		}
++		if (p[o] == t) {
++			*len = l;
++			return p + o + 3;
++		}
++		o += 3 + l;
++	}
++	return NULL;
++}
+ 
+ static void
++rfs_handle(const uint8_t *m, uint32_t len)
++{
++	if (len < 39 || m[32] != 0) {
++		return;
++	}
++	const uint16_t id = m[35] | (uint16_t)m[36] << 8;
++	const uint8_t *body = m + 39;
++	const uint32_t blen = MIN((uint32_t)(m[37] | m[38] << 8), len - 39);
++	uint8_t t[32] = {2, 4, 0, 0, 0, 0, 0};      /* TLV 2: result 0, error 0 */
++	uint32_t l = 0, tl = 7;
++	const uint8_t *v;
++	uint32_t caller = 0xffffffffu;
++	if ((v = rfs_tlv(body, blen, 1, &l)) != NULL && l >= 4 && id != 1) {
++		memcpy(&caller, v, 4);
++	}
++	switch (id) {
++	case 1: {                               /* open */
++		char path[64] = "";
++		if (v) {
++			memcpy(path, v, MIN(l, (uint32_t)sizeof(path) - 1));
++		}
++		int f = -1;
++		for (int i = 0; i < 4; i++) {
++			if (!strcmp(path, rfs_files[i].path)) {
++				f = i;
++			}
++		}
++		int e = f < 0 ? ENOENT : 0;
++		if (f >= 0 && !rfs_f[f].open) {
++			uint32_t lun = 0;
++			uint64_t first = 0, blocks = 0;
++			e = pandora_part_find(rfs_files[f].part, &lun, &first, &blocks);
++			const uint64_t size = MIN(blocks * 4096, (uint64_t)RFS_FILE_SIZE);
++			if (!e) {
++				rfs_f[f].mem = (uint8_t *)ad_map(RFS_FILE_PA + (uint64_t)f * RFS_FILE_SIZE, RFS_FILE_SIZE, VM_WIMG_WCOMB);
++				e = rfs_f[f].mem ? pandora_part_pread(0, rfs_f[f].mem, size) : ENOMEM;
++			}
++			if (!e) {
++				rfs_f[f].size = size;
++				rfs_f[f].open = true;
++			}
++		}
++		printf("PANDORA MODEM: file service: open %s -> %d (%llu bytes, in RAM)\n", path, e, f >= 0 ? rfs_f[f].size : 0);
++		if (e) {
++			t[3] = 1;
++			t[5] = 1;
++		} else {
++			t[7] = 0x10; t[8] = 4; t[9] = 0;
++			const uint32_t c = (uint32_t)f + 1;
++			memcpy(t + 10, &c, 4);
++			tl = 14;
++		}
++		break;
++	}
++	case 2:                                 /* close */
++		printf("PANDORA MODEM: file service: close %u (%u reads, %u writes kept in RAM so far)\n", caller, ms_reads, ms_writes);
++		break;
++	case 3: {                               /* read or write vectors */
++		const int f = (int)caller - 1;
++		uint32_t dl = 0, il = 0;
++		const uint8_t *dir = rfs_tlv(body, blen, 2, &dl), *iv = rfs_tlv(body, blen, 3, &il);
++		bool bad = f < 0 || f > 3 || !rfs_f[f < 0 ? 0 : f].open || !dir || !iv || il < 1 || !rfs_buf;
++		if (!bad) {
++			const uint32_t n = iv[0];
++			for (uint32_t i = 0; i < n && 1 + 12 * (i + 1) <= il; i++) {
++				uint32_t w[3];
++				memcpy(w, iv + 1 + 12 * i, 12);
++				const uint64_t off = (uint64_t)w[0] * 512, sz = (uint64_t)w[2] * 512;
++				if (off + sz > rfs_f[f].size || (uint64_t)w[1] + sz > RFS_BUF_SIZE) {
++					printf("PANDORA MODEM: file service: vector outside: sector %u count %u buffer %#x\n", w[0], w[2], w[1]);
++					bad = true;
++					break;
++				}
++				if (dir[0]) {
++					memcpy(rfs_f[f].mem + off, rfs_buf + w[1], (size_t)sz);       /* RAM only */
++					ms_writes++;
++				} else {
++					memcpy(rfs_buf + w[1], rfs_f[f].mem + off, (size_t)sz);
++					ms_reads++;
++				}
++			}
++			__asm__ volatile ("dsb sy" ::: "memory");
++			if ((ms_reads + ms_writes) % 16 == 1) {
++				printf("PANDORA MODEM: file service: %s on %u; %u reads, %u writes kept in RAM\n", dir[0] ? "write" : "read", caller, ms_reads, ms_writes);
++			}
++		}
++		if (bad) {
++			t[3] = 1;
++			t[5] = 1;
++		}
++		break;
++	}
++	case 4: {                               /* buffer */
++		const uint64_t a = RFS_BUF_PA;
++		t[7] = 0x10; t[8] = 8; t[9] = 0;
++		memcpy(t + 10, &a, 8);
++		tl = 18;
++		printf("PANDORA MODEM: file service: buffer %#llx asked by %u\n", a, caller);
++		break;
++	}
++	case 5:                                 /* device error: none */
++		t[7] = 0x10; t[8] = 1; t[9] = 0; t[10] = 0;
++		tl = 11;
++		break;
++	default:
++		printf("PANDORA MODEM: file service: message %u\n", id);
++		t[3] = 1;
++		t[5] = 2;
++		break;
++	}
++	rfs_reply(m, id, t, tl);
++}
++
++static void
++ms_worker(void *arg, wait_result_t w)
++{
++	(void)arg;
++	(void)w;
++	static uint8_t m[MS_MSG_MAX];
++	for (;;) {
++		if (__atomic_load_n(&ms_in_w, __ATOMIC_ACQUIRE) == ms_in_r) {
++			ad_sleep(2);
++			continue;
++		}
++		const uint32_t len = ms_in[ms_in_r % MS_RING].len;
++		memcpy(m, ms_in[ms_in_r % MS_RING].d, len);
++		__atomic_fetch_add(&ms_in_r, 1, __ATOMIC_RELEASE);
++		rfs_handle(m, len);
++	}
++}
++
++static void
++ms_rfs_prepare(void)
++{
++	thread_t thread;
++	int e = mss_assign(RFS_BUF_PA, RFS_BUF_SIZE, true);
++	rfs_buf = (uint8_t *)ad_map(RFS_BUF_PA, RFS_BUF_SIZE, VM_WIMG_WCOMB);
++	if (rfs_buf) {
++		bzero(rfs_buf, RFS_BUF_SIZE);
++	}
++	printf("PANDORA MODEM: file service buffer %#llx: assign %d, mapped %d\n", RFS_BUF_PA, e, rfs_buf != NULL);
++	if (kernel_thread_start(ms_worker, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++
++/* The links' thread: replies ready, sent here. */
++static void
++ms_tx_step(void)
++{
++	while (ms_ch && __atomic_load_n(&ms_out_w, __ATOMIC_ACQUIRE) != ms_out_r) {
++		if (qcom_glink_send(&ed_modem.gl, ms_ch, ms_out[ms_out_r % MS_RING].d, ms_out[ms_out_r % MS_RING].len) != QcomGlinkOk) {
++			return;
++		}
++		__atomic_fetch_add(&ms_out_r, 1, __ATOMIC_RELEASE);
++	}
++}
++
++static void
+ ms_qrtr_send_hello(QcomGlinkChannel *ch)
+ {
+ 	/* 0351: as qrtr_send_hello: to the broadcast node, the 20 byte control packet (t12: the modem did not react). */
+@@ -3327,16 +3575,20 @@
+ ms_receive(void *ctx, QcomGlinkChannel *ch, const uint8_t *d, uint32_t len)
+ {
+ 	(void)ctx;
+-	if (len < 32 || ms_rx_shown >= 200) {
++	if (len < 32) {
+ 		return;
+ 	}
+-	ms_rx_shown++;
+ 	uint32_t w[12] = {0};
+ 	memcpy(w, d, MIN(len, sizeof(w)));
++	const bool show = ms_rx_shown < 300 && !(w[0] == 1 && w[1] == 1 && w[7] == RFS_PORT);
++	if (show) {
++		ms_rx_shown++;
++	}
+ 	static const char *const names[12] = {"?", "DATA", "HELLO", "BYE", "NEW_SERVER", "DEL_SERVER", "DEL_CLIENT", "RESUME_TX",
+ 	    "EXIT", "PING", "NEW_LOOKUP", "DEL_LOOKUP"};
+ 	const uint32_t t = w[1];
+-	if (w[0] == 1 && t == 4 && len >= 48) {
++	if (!show) {
++	} else if (w[0] == 1 && t == 4 && len >= 48) {
+ 		printf("PANDORA MODEM: QRTR NEW_SERVER service %u instance %#x node %u port %u\n", w[9], w[10], w[11], len >= 52 ? d[48] : 0);
+ 	} else if (w[0] == 1 && t == 10) {
+ 		printf("PANDORA MODEM: QRTR NEW_LOOKUP (asks for) service %u instance %#x\n", w[9], w[10]);
+@@ -3344,8 +3596,22 @@
+ 		printf("PANDORA MODEM: QRTR v%u %s from %u:%u to %u:%u, %u bytes, words %08x %08x %08x\n", w[0], t < 12 ? names[t] : "?", w[2], w[3], w[6], w[7],
+ 		    w[5], w[8], w[9], w[10]);
+ 	}
++	if (w[0] == 1 && t == 1 && w[7] == RFS_PORT && len <= MS_MSG_MAX && (ms_in_w - ms_in_r) < MS_RING) {
++		ms_in[ms_in_w % MS_RING].len = len;
++		memcpy(ms_in[ms_in_w % MS_RING].d, d, len);
++		__atomic_fetch_add(&ms_in_w, 1, __ATOMIC_RELEASE);
++	}
++	if (w[0] == 1 && w[4]) {                /* confirm_rx: qrtr_tx_resume */
++		const uint32_t r[3] = {7, 1, w[7]};
++		ms_ctrl_send(ch, w[2], w[3], r, 3);
++	}
+ 	if (w[0] == 1 && t == 2) {
++		ms_modem_node = w[2];
+ 		ms_qrtr_send_hello(ch);
++		/* The service, as qrtr_publish: to the modem's name service; instance = version | instance << 8. */
++		const uint32_t ns[5] = {4, 14, 1, 1, RFS_PORT};
++		ms_ctrl_send(ch, ms_modem_node, 0xfffffffeu, ns, 5);
++		printf("PANDORA MODEM: file service announced to node %u\n", ms_modem_node);
+ 	}
+ }
+ 
+@@ -3353,7 +3619,7 @@
+ #define MS_TABLE_PA  0xe0700000ull      /* the tables of the assign call */
+ 
+ static int
+-mss_assign(uint64_t pa, uint64_t size)
++mss_assign(uint64_t pa, uint64_t size, bool shared)
+ {
+ 	static vm_offset_t tb;
+ 	static bool bridged;
+@@ -3371,9 +3637,13 @@
+ 		q[64 / 8 + 1] = size;
+ 		*(volatile uint32_t *)(tb + 128) = 15;                 /* destination: MSS_MSA */
+ 		*(volatile uint32_t *)(tb + 132) = 6;                  /* read and write */
++		if (shared) {
++			*(volatile uint32_t *)(tb + 152) = 3;          /* and HLOS still: the file service's buffer */
++			*(volatile uint32_t *)(tb + 156) = 6;
++		}
+ 		q[192 / 8] = 4;                                        /* args[3..6], beyond the registers */
+ 		q[192 / 8 + 1] = MS_TABLE_PA + 128;
+-		q[192 / 8 + 2] = 24;
++		q[192 / 8 + 2] = shared ? 48 : 24;
+ 		q[192 / 8 + 3] = 0;
+ 		__asm__ volatile ("dsb sy" ::: "memory");
+ 		scm_smc(SCM_FN(0xc, 0x16), SCM_ARGS(7) | (1u << 4) | (1u << 8) | (1u << 12), MS_TABLE_PA + 64, 16,
+@@ -3421,8 +3691,9 @@
+ 	if ((err = p2p_setup(e, "before the start"))) {
+ 		return;
+ 	}
+-	(void)mss_assign(0x84a00000ull, 0x5500000ull);
+-	(void)mss_assign(0x89f00000ull, 0xa80000ull);
++	(void)mss_assign(0x84a00000ull, 0x5500000ull, false);
++	(void)mss_assign(0x89f00000ull, 0xa80000ull, false);
++	ms_rfs_prepare();
+ 	if ((err = qmp_send("{class: image, res: load_state, name: modem, val: on}"))) {
+ 		printf("PANDORA MODEM: load_state failed %d\n", err);
+ 	}
+--- a/bsd/dev/pandora_wlan.c	2026-11-04 20:58:11
++++ b/bsd/dev/pandora_wlan.c	2026-11-04 20:58:11
+@@ -134,8 +134,8 @@
+ 		{"L3K_E1", 1200, 7},
+ 		{"L2G_E0", 1800, 7},
+ 		{"S2J_E1", 892, -1},
+-		{"S8F_E0", 1800, -1},
+-		{"S7F_E0", 1224, -1},
++		{"S8F_E0", 1876, -1},           /* 0353: cnss log: rfa1 min 1876000; the 1800 of regulator_summary is BT's */
++		{"S7F_E0", 1328, -1},           /* 0353: cnss log: rfa2 min 1328000 */
+ 		{"S1J_E1", 892, -1},
+ 	};
+ 	for (unsigned i = 0; i < sizeof(rails) / sizeof(rails[0]); i++) {
+@@ -514,11 +514,8 @@
+ #define WF_ELS   256u
+ 
+ /* 0349: below 4 GiB like Android's IOVAs (0xa0000000 on), non cached: low-bank RAM XNU does not use (Android's System RAM). */
+-/* 0352: Android's window is 0x18000000 + 0x98000000 (cnss_pci_init_smmu), so below 0xb0000000: free RAM by the DT. */
+-#define WF_LOW_FW   0xaa000000ull
+-#define WF_LOW_CTX  0xaa800000ull
+-#define WF_LOW_RDDM 0xab000000ull       /* 15 segments of 512 KiB, as Android's ramdump size 0x780000 */
+-#define WF_RDDM_N   15u
++#define WF_LOW_FW   0xe1000000ull
++#define WF_LOW_CTX  0xe1800000ull
+ 
+ static vm_offset_t
+ wf_low(uint64_t pa, vm_size_t size)
+@@ -620,21 +617,6 @@
+ 			sum += w[k];
+ 		}
+ 		printf("PANDORA WLAN: image: sum32 of 512 KiB %#x (wanted 0x99142d59), last word %#x\n", sum, w[WF_SEG / 4 - 1]);
+-	}
+-	/* 0352: mhi_rddm_prepare comes before BHI on Android (mhi log: "BHIe programming for RDDM", len 0xf0). */
+-	{
+-		struct { uint64_t pa, len; } *rv = (void *)(ctx + 0x31000);
+-		const uint64_t rv_pa = ctx_pa + 0x31000;
+-		for (unsigned k = 0; k < WF_RDDM_N; k++) {
+-			rv[k].pa = WF_LOW_RDDM + (uint64_t)k * WF_SEG;
+-			rv[k].len = WF_SEG;
+-		}
+-		wf_flush(rv_pa, 0x1000);
+-		wr(mhi, bhie + 0x64, (uint32_t)(rv_pa >> 32));
+-		wr(mhi, bhie + 0x60, (uint32_t)rv_pa);
+-		wr(mhi, bhie + 0x68, WF_RDDM_N * 16u);
+-		wr(mhi, bhie + 0x70, 0x2345678);
+-		printf("PANDORA WLAN: RDDM vectors at %#llx, BHIe RX status %#x\n", rv_pa, rd(mhi, bhie + 0x78));
+ 	}
+ 	wl_mark("before BHI");
+ 	/* mhi_async_power_up, mhi_fw_load_bhi */

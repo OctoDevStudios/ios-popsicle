@@ -1,0 +1,23 @@
+xnu 0366: Wi-Fi: the firmware crash report (RDDM) when the driver is refused
+
+--- a/bsd/dev/pandora_wlan.c
++++ b/bsd/dev/pandora_wlan.c
+@@ -1324,6 +1324,8 @@
+ 		}
+ 	}
+ }
++
++extern void nw_mhi_crash_report(const char *why);
+ 
+ static void
+ nw_run(void)
+@@ -1372,6 +1374,9 @@
+ 		if (scan_at && now >= scan_at && scans < 3) {
+ 			int sr = nw_wifi_scan(NULL, 0);
+ 			printf("PANDORA NW: scan asked -> %d\n", sr);
++			if (sr) {
++				nw_mhi_crash_report("scan refused");
++			}
+ 			scans++;
+ 			scan_at = now + 15000;
+ 		}

@@ -1,0 +1,49 @@
+xnu 0352: Wi-Fi: DMA below 0xb0000000 as Android, RDDM vectors before BHI, image checksum
+
+--- a/bsd/dev/pandora_wlan.c	2026-11-04 20:41:03
++++ b/bsd/dev/pandora_wlan.c	2026-11-04 20:41:03
+@@ -514,8 +514,11 @@
+ #define WF_ELS   256u
+ 
+ /* 0349: below 4 GiB like Android's IOVAs (0xa0000000 on), non cached: low-bank RAM XNU does not use (Android's System RAM). */
+-#define WF_LOW_FW   0xe1000000ull
+-#define WF_LOW_CTX  0xe1800000ull
++/* 0352: Android's window is 0x18000000 + 0x98000000 (cnss_pci_init_smmu), so below 0xb0000000: free RAM by the DT. */
++#define WF_LOW_FW   0xaa000000ull
++#define WF_LOW_CTX  0xaa800000ull
++#define WF_LOW_RDDM 0xab000000ull       /* 15 segments of 512 KiB, as Android's ramdump size 0x780000 */
++#define WF_RDDM_N   15u
+ 
+ static vm_offset_t
+ wf_low(uint64_t pa, vm_size_t size)
+@@ -609,6 +612,30 @@
+ 	}
+ 	wf_flush(ctx_pa + 0x30000, 0x1000);
+ 
++	{
++		/* 0352: is the image whole in memory? tools side: sum32 of the first 512 KiB 0x99142d59, last word 0. */
++		const volatile uint32_t *w = (const volatile uint32_t *)fw;
++		uint32_t sum = 0;
++		for (uint32_t k = 0; k < WF_SEG / 4; k++) {
++			sum += w[k];
++		}
++		printf("PANDORA WLAN: image: sum32 of 512 KiB %#x (wanted 0x99142d59), last word %#x\n", sum, w[WF_SEG / 4 - 1]);
++	}
++	/* 0352: mhi_rddm_prepare comes before BHI on Android (mhi log: "BHIe programming for RDDM", len 0xf0). */
++	{
++		struct { uint64_t pa, len; } *rv = (void *)(ctx + 0x31000);
++		const uint64_t rv_pa = ctx_pa + 0x31000;
++		for (unsigned k = 0; k < WF_RDDM_N; k++) {
++			rv[k].pa = WF_LOW_RDDM + (uint64_t)k * WF_SEG;
++			rv[k].len = WF_SEG;
++		}
++		wf_flush(rv_pa, 0x1000);
++		wr(mhi, bhie + 0x64, (uint32_t)(rv_pa >> 32));
++		wr(mhi, bhie + 0x60, (uint32_t)rv_pa);
++		wr(mhi, bhie + 0x68, WF_RDDM_N * 16u);
++		wr(mhi, bhie + 0x70, 0x2345678);
++		printf("PANDORA WLAN: RDDM vectors at %#llx, BHIe RX status %#x\n", rv_pa, rd(mhi, bhie + 0x78));
++	}
+ 	wl_mark("before BHI");
+ 	/* mhi_async_power_up, mhi_fw_load_bhi */
+ 	wr(mhi, bhi + 0x20, 0);

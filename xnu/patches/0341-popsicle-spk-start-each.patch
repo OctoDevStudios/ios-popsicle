@@ -1,0 +1,47 @@
+diff --git a/bsd/dev/pandora_adsp.c b/bsd/dev/pandora_adsp.c
+--- a/bsd/dev/pandora_adsp.c
++++ b/bsd/dev/pandora_adsp.c
+@@ -1749,6 +1749,26 @@
+ 	c->oob = false;
+ 	c->must = must;
+ 	c->len = spk_param(c->inband, APM_MODULE_IID, APM_PARAM_SG_LIST, list, 4 + 4 * spk.nsg);
++}
++
++/* popsicle: boot-arg pandora_spk_each=1, GRAPH_START one subgraph at a time, so a refusal names its subgraph. */
++static void
++spk_add_start_each(void)
++{
++	static const char *const what[4] = {"graph start, subgraph 0", "graph start, subgraph 1", "graph start, subgraph 2",
++		                            "graph start, subgraph 3"};
++	for (unsigned i = 0; i < spk.nsg && i < 4 && spk.ncmd < 16; i++) {
++		uint8_t list[8];
++		spk_put32(list, 1);
++		spk_put32(list + 4, spk.sg[i]);
++		printf("PANDORA SPK: %s is %#x\n", what[i], spk.sg[i]);
++		struct spk_cmd *c = &spk.cmds[spk.ncmd++];
++		c->what = what[i];
++		c->opcode = APM_CMD_GRAPH_START;
++		c->oob = false;
++		c->must = true;
++		c->len = spk_param(c->inband, APM_MODULE_IID, APM_PARAM_SG_LIST, list, 8);
++	}
+ }
+ 
+ /* apm_cmd_header {payload address lsw, msw, mem map handle, payload size}: out of band the DSP buffer's address
+@@ -1946,7 +1966,15 @@
+ 		spk_add_oob("volume", APM_CMD_SET_CFG, v, vl, false);
+ 	}
+ 	spk_add_sgs("graph prepare", APM_CMD_GRAPH_PREPARE, true);
+-	spk_add_sgs("graph start", APM_CMD_GRAPH_START, true);
++	{
++		int each = 0;
++		(void)PE_parse_boot_argn("pandora_spk_each", &each, sizeof(each));
++		if (each) {
++			spk_add_start_each();
++		} else {
++			spk_add_sgs("graph start", APM_CMD_GRAPH_START, true);
++		}
++	}
+ 	kfree_data(f, (vm_size_t)size);
+ 	printf("PANDORA SPK: %s graph: %u subgraphs, open %u bytes, calibration %u, TDM %u (%u channels, endpoint %#x); "
+ 	    "%u commands\n", spk_cur == SpkReceiver ? "receiver" : "speaker", spk.nsg, len[1], len[2], len[3], spk_ii.ch,

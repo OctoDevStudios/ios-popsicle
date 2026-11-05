@@ -1,0 +1,24 @@
+diff --git a/bsd/dev/pandora_cpu.c b/bsd/dev/pandora_cpu.c
+--- a/bsd/dev/pandora_cpu.c
++++ b/bsd/dev/pandora_cpu.c
+@@ -521,7 +521,7 @@
+  * Patch 0257: under these, the body temperature's caps (pandora_cpu_body_cap, from pandora_therm.c), which
+  * hold the clusters far below such junction temperatures, as Android's mi_thermald does.
+  */
+-#define T_HAL       1050    /* tenths of a degree */
++#define T_HAL       950     /* tenths of a degree; popsicle: 95 C (was 105: 104.7 C reached at boot with the body caps relaxed) */
+ #define T_HAL_HYST  50
+ #define T_PLUG      1140
+ #define T_PLUG_HYST 60
+diff --git a/bsd/dev/pandora_therm.c b/bsd/dev/pandora_therm.c
+--- a/bsd/dev/pandora_therm.c
++++ b/bsd/dev/pandora_therm.c
+@@ -621,7 +621,7 @@
+ 		/* popsicle: relaxed, nothing is capped under the table's second step (35 C after the shift): its first step caps
+ 		 * the clusters from 25 C, far under what this chassis reaches at rest. */
+ 		int32_t lim = body - relax;
+-		if (relax && lim < 35000) {
++		if (relax && lim < (pt_step[0] < 0 ? 35000 : 32000)) {    /* in at 35, out at 32: no flip-flop at the edge */
+ 			lim = 20000;
+ 		}
+ 		const bool moved = pt_level >= 2 && measured && gauge && pt_limit(lim);

@@ -1,0 +1,21 @@
+diff --git a/bsd/dev/pandora_therm.c b/bsd/dev/pandora_therm.c
+--- a/bsd/dev/pandora_therm.c
++++ b/bsd/dev/pandora_therm.c
+@@ -609,7 +609,16 @@
+ 			body = vs[v] > body ? vs[v] : body;
+ 		}
+ 		/* limits only from a whole reading: all six PMIC inputs and the gauge */
+-		const bool moved = pt_level >= 2 && measured && gauge && pt_limit(body);
++		/* popsicle: boot-arg pandora_therm_relax=N, the body limits apply N degrees later (Xiaomi's table is the 17 Pro's
++		 * and caps the big cores from 40 C). The junction limits (pandora_cpu.c) and the firmware's are not moved. */
++		static int32_t relax = -1;
++		if (relax < 0) {
++			int r = 0;
++			(void)PE_parse_boot_argn("pandora_therm_relax", &r, sizeof(r));
++			relax = r > 0 && r <= 10 ? r * 1000 : 0;
++			printf("PANDORA THERM: body limits %d C later\n", relax / 1000);
++		}
++		const bool moved = pt_level >= 2 && measured && gauge && pt_limit(body - relax);
+ 		pt_hid_update(in, vs, measured && gauge);
+ 		if (moved) {
+ 			char b[12];

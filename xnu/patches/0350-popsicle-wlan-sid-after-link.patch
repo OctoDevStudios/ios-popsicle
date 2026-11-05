@@ -1,0 +1,140 @@
+xnu 0350: Wi-Fi stream table after the link as Android; log synced before each risky step
+
+--- a/bsd/dev/pandora_wlan.c	2026-11-04 19:31:33
++++ b/bsd/dev/pandora_wlan.c	2026-11-04 19:31:33
+@@ -34,7 +34,11 @@
+ extern int pandora_part_file(const char *name, void *dst, uint64_t max, uint64_t *size);
+ extern int pandora_smmu_pass(uint16_t id, uint16_t mask);
+ extern int pandora_smmu_report(const char *when);
++extern bool pandora_log_sync(void);
+ 
++/* 0350: the log on disk before each risky step: t11's hard stop lost everything after the last periodic flush. */
++#define wl_mark(what) do { printf("PANDORA WLAN: step: %s\n", (what)); (void)pandora_log_sync(); } while (0)
++
+ #define WL_GCC_PA    0x00100000ull
+ #define WL_TLMM_PA   0x0f100000ull
+ #define WL_PARF_PA   0x01c00000ull
+@@ -240,6 +244,7 @@
+ 	wl_sleep(5);
+ 	/* 0345: cnss_power_on_device_host: vregs, rf_clk (c1a_e0, "rfclka1" in cmd-db), wlan_en, then host SOL low.
+ 	 * t8: LTSSM stayed in Detect, nothing on the other side. */
++	wl_mark("rails on, before WLAN_EN");
+ 	wl_pins("before");
+ 	printf("PANDORA WLAN: rf_clk C1A_E0 -> %d\n", pandora_rpmh_clk("C1A_E0"));
+ 	delay(100);
+@@ -267,6 +272,7 @@
+ 	}
+ 	printf("PANDORA WLAN: phy GDSC after %u us: %#x cfg %#x\n", i, rd(gcc, 0x6c000), rd(gcc, 0x6c004));
+ 
++	wl_mark("before CRM vote");
+ 	wl_sm_load();
+ 	e = wl_crm_vote(PERF_LVL_GEN3);
+ 	if (e) {
+@@ -306,28 +312,9 @@
+ 	atu = wl_map(WL_ATU_PA, 0x1000);
+ 	if (!parf || !phy || !dbi || !atu) {
+ 		return ENOMEM;
+-	}
+-
+-	/* 0349: msm_pcie_config_sid: requester ids to SMMU streams, DT iommu-map <0 0x1400>, <0x100 0x1401>. t10: bypass left on,
+-	 * the chip's first DMA failed (BHI status 3) and the sound went at that moment. CRC8 MSB, polynomial 7, of the id
+-	 * big endian; bdf 0 has hash 0 and value 0, so one entry. */
+-	{
+-		uint8_t crc = 0;
+-		static const uint8_t be[2] = {0x01, 0x00};
+-		for (unsigned b = 0; b < 2; b++) {
+-			crc ^= be[b];
+-			for (unsigned n = 0; n < 8; n++) {
+-				crc = (crc & 0x80) ? (uint8_t)((crc << 1) ^ 0x07) : (uint8_t)(crc << 1);
+-			}
+-		}
+-		clr(parf, 0x2c00, 1u);
+-		for (unsigned h = 0; h < 256; h++) {
+-			wr(parf, 0x2000 + 4 * h, 0);
+-		}
+-		wr(parf, 0x2000 + 4u * crc, (0x100u << 16) | (1u << 8));
+-		printf("PANDORA WLAN: BDF to SID: config %#x, 1:0.0 at hash %#x reads %#x\n", rd(parf, 0x2c00), crc, rd(parf, 0x2000 + 4u * crc));
+ 	}
+ 
++	wl_mark("before PARF and PHY");
+ 	/* msm_pcie_enable_link */
+ 	wr(parf, 0x1000, 4);                    /* root complex */
+ 	clr(parf, 0x20, 1u << 5);               /* PM_CTRL: L1 allowed */
+@@ -382,6 +369,7 @@
+ 	}
+ 	delay(100);
+ 	wl_pins("before PERST release");
++	wl_mark("before PERST release");
+ 	wl_gpio(GPIO_PERST, 0x200u | 1u, 1);    /* out of reset */
+ 	wl_sleep(5);
+ 
+@@ -425,7 +413,29 @@
+ 		return ETIMEDOUT;
+ 	}
+ 	printf("PANDORA WLAN: LINK UP: Gen%u x%u\n", (lnk >> 16) & 0xf, (lnk >> 20) & 0x3f);
++	wl_mark("before the stream table");
++	/* 0350: after the link, as msm_pcie_enable does (t11: before it, the phone stopped at this step). 0349: msm_pcie_config_sid: requester ids to SMMU streams, DT iommu-map <0 0x1400>, <0x100 0x1401>. t10: bypass left on,
++	 * the chip's first DMA failed (BHI status 3) and the sound went at that moment. CRC8 MSB, polynomial 7, of the id
++	 * big endian; bdf 0 has hash 0 and value 0, so one entry. */
++	{
++		uint8_t crc = 0;
++		static const uint8_t be[2] = {0x01, 0x00};
++		for (unsigned b = 0; b < 2; b++) {
++			crc ^= be[b];
++			for (unsigned n = 0; n < 8; n++) {
++				crc = (crc & 0x80) ? (uint8_t)((crc << 1) ^ 0x07) : (uint8_t)(crc << 1);
++			}
++		}
++		clr(parf, 0x2c00, 1u);
++		for (unsigned h = 0; h < 256; h++) {
++			wr(parf, 0x2000 + 4 * h, 0);
++		}
++		wr(parf, 0x2000 + 4u * crc, (0x100u << 16) | (1u << 8));
++		printf("PANDORA WLAN: BDF to SID: config %#x, 1:0.0 at hash %#x reads %#x\n", rd(parf, 0x2c00), crc, rd(parf, 0x2000 + 4u * crc));
++	}
+ 
++	wl_mark("after the stream table");
++
+ 	wl_sleep(100);
+ 	wr(dbi, 0x18, (rd(dbi, 0x18) & 0xff000000u) | 0x00ff0100u);     /* primary 0, secondary 1, subordinate 255 */
+ 	wr(atu, 0x04, 0);
+@@ -544,6 +554,7 @@
+ 		return e;
+ 	}
+ 	set(dbi, WL_CFG_OFF + 0x04, 6u);        /* memory, bus master */
++	wl_mark("before the firmware memory");
+ 	const vm_offset_t fw = wf_low(fw_pa, WF_MAX);
+ 	/* One block: contexts, rings, vector table. */
+ 	const vm_offset_t ctx = wf_low(ctx_pa, 0x40000);
+@@ -571,6 +582,7 @@
+ 	}
+ 	wf_flush(ctx_pa + 0x30000, 0x1000);
+ 
++	wl_mark("before BHI");
+ 	/* mhi_async_power_up, mhi_fw_load_bhi */
+ 	wr(mhi, bhi + 0x20, 0);
+ 	wr(mhi, bhi + 0x2c, 0);
+@@ -590,6 +602,7 @@
+ 	printf("PANDORA WLAN: BHI image: status %u after %u0 ms\n", st, i);
+ 	wf_state(mhi, bhi, "after BHI");
+ 	(void)pandora_smmu_report("after BHI");
++	(void)pandora_log_sync();
+ 	if (st != 2) {
+ 		return EIO;
+ 	}
+@@ -642,6 +655,7 @@
+ 	wr(mhi, chdb + 8 * 127 + 4, 0);                             /* MHI_DEV_WAKE_DB */
+ 	wr(mhi, chdb + 8 * 127, 1);
+ 	wf_state(mhi, bhi, "M0 asked");
++	(void)pandora_log_sync();
+ 
+ 	/* SBL: then the rest of the image through BHIe (mhi_download_amss_image). */
+ 	uint32_t ee = 0;
+@@ -669,6 +683,7 @@
+ 		wl_sleep(10);
+ 	}
+ 	printf("PANDORA WLAN: BHIe: %u segments, status %u after %u0 ms\n", nvec, st, i);
++	(void)pandora_log_sync();
+ 	for (unsigned t = 0; t < 30; t++) {
+ 		wl_sleep(1000);
+ 		ee = rd(mhi, bhi + 0x28);

@@ -1,0 +1,163 @@
+xnu 0360: modem TFTP: firmware partition reselected after file-service reads, whole files cached in RAM, larger blocks
+
+--- a/bsd/dev/pandora_adsp.c	2026-11-04 22:42:03
++++ b/bsd/dev/pandora_adsp.c	2026-11-04 22:42:03
+@@ -3104,7 +3104,7 @@
+ 
+ /* 0349: defined with the modem's start, below. */
+ static bool ms_gl_wanted;
+-static uint8_t ms_storage[4096 * 8];
++static uint8_t ms_storage[8192 * 8];
+ static QcomGlinkChannel *ms_ch;
+ static void ms_state(void *ctx, QcomGlinkChannel *ch, int up);
+ static void ms_receive(void *ctx, QcomGlinkChannel *ch, const uint8_t *d, uint32_t len);
+@@ -3186,7 +3186,7 @@
+ 			int ge = gl_start(&ed_modem, false);
+ 			printf("PANDORA MODEM: GLINK start -> %d\n", ge);
+ 			if (!ge) {
+-				ms_ch = qcom_glink_channel(&ed_modem.gl, "IPCRTR", 4096, 8, ms_storage, &ms_client, NULL, 0);
++				ms_ch = qcom_glink_channel(&ed_modem.gl, "IPCRTR", 8192, 8, ms_storage, &ms_client, NULL, 0);
+ 				printf("PANDORA MODEM: channel IPCRTR waits%s\n", ms_ch ? "" : ": failed");
+ 			}
+ 		}
+@@ -3325,7 +3325,7 @@
+ #define RFS_FILE_PA   0xe3000000ull     /* 8 MiB per file */
+ #define RFS_FILE_SIZE 0x800000u
+ #define RFS_PORT      0x4000u
+-#define MS_MSG_MAX    4096u
++#define MS_MSG_MAX    8192u
+ #define MS_RING       8u
+ extern int pandora_part_find(const char *name, uint32_t *lun, uint64_t *first, uint64_t *blocks);
+ extern int pandora_part_pread(uint64_t off, void *dst, uint64_t len);
+@@ -3407,7 +3407,9 @@
+  * 0358: tqftpserv in small: /readonly/firmware from the read-only firmware partition already mounted, /readwrite in RAM
+  * only (gone at the next boot), nothing else. wsize 1 and a block size that fits one message, whatever is asked.
+  */
+-#define TF_BLK_MAX   3584u              /* one message of MS_MSG_MAX */
++#define TF_BLK_MAX   7680u              /* one message of MS_MSG_MAX; GLINK takes half its 16 KiB FIFO at a time */
++#define TF_CACHE_PA  0xe6000000ull      /* whole firmware files, read once: 64 MiB */
++#define TF_CACHE_SZ  0x4000000u
+ #define TF_STORE_PA  0xe5000000ull      /* 16 files of 1 MiB */
+ #define TF_STORE_SZ  0x100000u
+ static struct {
+@@ -3420,14 +3422,63 @@
+ 	uint32_t port;
+ 	bool active, write, fat;
+ 	int file;
+-	struct fw_file ff;
+ 	uint64_t size, seek, rsize;
+ 	uint32_t blk;
+ 	uint16_t expected;
+ } tf_c[16];
+ static uint32_t tf_shown;
++/* 0360: a block read walks the FAT from the file's start, far too slow for 21 MiB: whole files in RAM on first use. */
++static struct {
++	char name[72];
++	uint8_t *mem;
++	uint64_t size;
++} tf_cache[8];
++static uint8_t *tf_cache_map;
++static uint64_t tf_cache_used;
+ 
+ static int
++tf_cached(const char *path, const char *name)
++{
++	for (int i = 0; i < 8; i++) {
++		if (tf_cache[i].mem && !strcmp(tf_cache[i].name, name)) {
++			return i;
++		}
++	}
++	struct fw_file ff;
++	int e = fw_open(path, true, &ff);
++	if (e) {
++		printf("PANDORA MODEM: TFTP: %s: open -> %d\n", path, e);
++		return -1;
++	}
++	if (!tf_cache_map && !(tf_cache_map = (uint8_t *)ad_map(TF_CACHE_PA, TF_CACHE_SZ, VM_WIMG_WCOMB))) {
++		return -1;
++	}
++	if (tf_cache_used + ff.size > TF_CACHE_SZ) {
++		printf("PANDORA MODEM: TFTP: %s: %llu bytes do not fit\n", path, ff.size);
++		return -1;
++	}
++	for (int i = 0; i < 8; i++) {
++		if (!tf_cache[i].mem) {
++			uint8_t *m = tf_cache_map + tf_cache_used;
++			const uint64_t t0 = mach_absolute_time();
++			e = fw_pread(&ff, 0, m, ff.size);
++			uint64_t ns;
++			absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++			printf("PANDORA MODEM: TFTP: %s: %llu bytes read in %llu ms -> %d\n", path, ff.size, ns / 1000000, e);
++			if (e) {
++				return -1;
++			}
++			tf_cache[i].mem = m;
++			tf_cache[i].size = ff.size;
++			strlcpy(tf_cache[i].name, name, sizeof(tf_cache[i].name));
++			tf_cache_used += (ff.size + 0xfff) & ~0xfffull;
++			return i;
++		}
++	}
++	return -1;
++}
++
++static int
+ tf_find(const char *name, bool make)
+ {
+ 	for (int i = 0; i < 16; i++) {
+@@ -3477,11 +3528,7 @@
+ 	b[3] = (uint8_t)(last + 1);
+ 	if (n) {
+ 		if (tf_c[c].fat) {
+-			if (fw_pread(&tf_c[c].ff, off, b + 4, n)) {
+-				tf_error(req, 0, "read error");
+-				tf_c[c].active = false;
+-				return;
+-			}
++			memcpy(b + 4, tf_cache[tf_c[c].file].mem + off, (size_t)n);
+ 		} else {
+ 			memcpy(b + 4, tf_store[tf_c[c].file].mem + off, (size_t)n);
+ 		}
+@@ -3558,12 +3605,13 @@
+ 		tf_c[c].rsize = rsize;
+ 		tf_c[c].write = op == 2;
+ 		if (op == 1 && !strncmp(name, "/readonly/firmware/image/", 25)) {
+-			if (fw_open(name + 25, true, &tf_c[c].ff)) {
++			tf_c[c].file = tf_cached(name + 25, name);
++			if (tf_c[c].file < 0) {
+ 				tf_error(m, 1, "file not found");
+ 				return;
+ 			}
+ 			tf_c[c].fat = true;
+-			tf_c[c].size = tf_c[c].ff.size;
++			tf_c[c].size = tf_cache[tf_c[c].file].size;
+ 		} else if (op == 1) {
+ 			tf_c[c].file = tf_find(name, false);
+ 			if (tf_c[c].file < 0) {
+@@ -3725,6 +3773,17 @@
+ 			if (!e) {
+ 				rfs_f[f].mem = (uint8_t *)ad_map(RFS_FILE_PA + (uint64_t)f * RFS_FILE_SIZE, RFS_FILE_SIZE, VM_WIMG_WCOMB);
+ 				e = rfs_f[f].mem ? pandora_part_pread(0, rfs_f[f].mem, size) : ENOMEM;
++			}
++			/* 0360: pandora_part_pread stays in the partition found last, and the FAT reads with it: back to the
++			 * firmware partition, or TFTP reads look for their directory inside modemst (t21). */
++			{
++				char slot[4] = "", fp[24];
++				uint32_t l2 = 0;
++				uint64_t f2 = 0, b2 = 0;
++				if (PE_parse_boot_arg_str("pandora_slot", slot, sizeof(slot))) {
++					snprintf(fp, sizeof(fp), "modemfirmware_%c", slot[0]);
++					(void)pandora_part_find(fp, &l2, &f2, &b2);
++				}
+ 			}
+ 			if (!e) {
+ 				rfs_f[f].size = size;
+@@ -3812,7 +3871,7 @@
+ 	static uint8_t m[MS_MSG_MAX];
+ 	for (;;) {
+ 		if (__atomic_load_n(&ms_in_w, __ATOMIC_ACQUIRE) == ms_in_r) {
+-			ad_sleep(2);
++			ad_sleep(1);
+ 			continue;
+ 		}
+ 		const uint32_t len = ms_in[ms_in_r % MS_RING].len;
