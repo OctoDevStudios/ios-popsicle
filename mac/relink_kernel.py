@@ -1,13 +1,18 @@
 #!/usr/bin/python3 -I
 """Relink a PANDORA kernel on this Mac from a CI run's objects, with another Wi-Fi driver object (no C compile).
 
-  mac/relink_kernel.py WORK NW_ALL_O OUT
+  mac/relink_kernel.py WORK NW_ALL_O OUT [--overlay DIR]
+
+DIR: objects from mac/kernel_cc.py, used in place of the CI objects of the same name.
 
 WORK: xnu-objects artifact unpacked (obj/, linklibs/) and ci.log (`gh run view ID --log`).
 Writes OUT/kernel.development.pandora (stripped) and OUT/kernel.development.pandora.unstripped.
 """
 import os, re, shlex, subprocess, sys
 work, nw, out = (os.path.abspath(os.path.expanduser(a)) for a in sys.argv[1:4])
+overlay = None
+if '--overlay' in sys.argv:
+    overlay = os.path.abspath(os.path.expanduser(sys.argv[sys.argv.index('--overlay') + 1]))
 os.makedirs(out, exist_ok=True)
 cfg = os.path.join(work, 'obj/DEVELOPMENT_ARM64_PANDORA')
 line = next(l for l in open(os.path.join(work, 'ci.log'), errors='replace')
@@ -22,9 +27,19 @@ cc = os.path.join(libs, 'libcc_kext.a')
 if not os.path.exists(cc):
     os.symlink('libclang_rt.cc_kext.a', cc)
 fl = os.path.join(out, 'link.filelist')
+used = total = 0
 with open(fl, 'w') as f:
     for p in open(os.path.join(cfg, 'link.filelist')):
-        f.write(p.strip().replace(RUN, cfg) + '\n')
+        q = p.strip().replace(RUN, cfg)
+        if overlay:
+            rel = os.path.relpath(q, cfg); comp = rel.split('/')[0]; stem = os.path.basename(q).rsplit('.', 1)[0]
+            for ext in ('o', 'cpo'):
+                o = os.path.join(overlay, comp, 'DEVELOPMENT', stem + '.' + ext)
+                if os.path.exists(o):
+                    q = o; used += 1; break
+        total += 1
+        f.write(q + '\n')
+if overlay: print(f'overlay: {used} of {total} objects replaced')
 new = ['xcrun', 'clang++']
 i = 1
 while i < len(args):
