@@ -7,6 +7,8 @@ WORK: holds ci.log, bt/ (xnu-buildtree) and obj/ (xnu-objects). SOURCE: path und
 Sources are taken from bt/xnu. Objects go to OUTDIR/<config-relative path>; mac/relink_kernel.py --overlay OUTDIR links them.
 """
 import concurrent.futures as cf, os, re, shlex, subprocess, sys, time
+XC15 = '/Applications/Xcode_15.0.1.app/Contents/Developer'
+if os.path.isdir(XC15): os.environ.setdefault('DEVELOPER_DIR', XC15)   # the compiler of the CI build: same code as CI
 a = sys.argv[1:]
 work, out = os.path.abspath(os.path.expanduser(a[0])), os.path.abspath(os.path.expanduser(a[1]))
 a = a[2:]; every = '--all' in a; jobs = 6
@@ -31,6 +33,18 @@ for line in open(os.path.join(work, 'ci.log'), errors='replace'):
 def component(src):
     if src.startswith(CFG + '/'): return src.split('/')[3]
     return src.split('/')[0]
+# What xnu's Makefile.template does after compiling (SEG_HACK): libsa goes to __KLD and __KLDDATA, listed files to __HIB.
+SEG = os.path.join(BT, 'build/xnu.obj/SETUP/setsegname/setsegname')
+def seg(obj, *a):
+    subprocess.run([SEG, *a, '-o', obj + '__', obj], check=True, capture_output=True); os.replace(obj + '__', obj)
+def segments(src, obj):
+    comp = component(src)
+    if comp == 'libsa':
+        seg(obj, '-s', '__TEXT', '-n', '__KLD'); seg(obj, '-i', '__KLD', '-n', '__KLDDATA'); return
+    ci = os.path.join(work, 'obj/DEVELOPMENT_ARM64_PANDORA', comp, 'DEVELOPMENT', os.path.basename(obj))
+    if os.path.exists(ci):
+        o = subprocess.run(['xcrun', 'otool', '-l', ci], capture_output=True, text=True).stdout
+        if re.search(r'segname __HIB\b', o): seg(obj, '-n', '__HIB')
 def build(src):
     args = cmds[src]; new = [CLANG if os.path.basename(args[0]) == 'clang' else CLANG + '++', '-w', '-ferror-limit=20']
     obj_dir = os.path.join(out, component(src), 'DEVELOPMENT'); os.makedirs(obj_dir, exist_ok=True)
@@ -40,12 +54,13 @@ def build(src):
         if x.startswith('-W') or x.startswith('-ferror-limit') or x.startswith('--serialize'): continue
         x = re.sub(r'/Applications/Xcode_[^/]*/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX[0-9.]*\.sdk/*', SDK + '/', x)
         new.append(x.replace(DXB, BT))
-    new[-1:-1] = ['-o', obj]
+    new[-1:-1] = ['-o', obj, '-fmacro-prefix-map=' + BT + '=' + DXB, '-fdebug-prefix-map=' + BT + '=' + DXB]   # same __FILE__ strings as CI
     cwd = os.path.join(BT, CFG, component(src), 'DEVELOPMENT')
     try:
         r = subprocess.run(new, cwd=cwd, capture_output=True, text=True)
     except OSError as e:
         return src, 1, repr(e)
+    if r.returncode == 0: segments(src, obj)
     return src, r.returncode, r.stderr[-1500:]
 want = sorted(cmds) if every else a
 t = time.time(); bad = []

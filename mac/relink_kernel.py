@@ -9,6 +9,8 @@ WORK: xnu-objects artifact unpacked (obj/, linklibs/) and ci.log (`gh run view I
 Writes OUT/kernel.development.pandora (stripped) and OUT/kernel.development.pandora.unstripped.
 """
 import os, re, shlex, subprocess, sys
+XC15 = '/Applications/Xcode_15.0.1.app/Contents/Developer'
+if os.path.isdir(XC15): os.environ.setdefault('DEVELOPER_DIR', XC15)   # the linker of the CI build
 work, nw, out = (os.path.abspath(os.path.expanduser(a)) for a in sys.argv[1:4])
 overlay = None
 if '--overlay' in sys.argv:
