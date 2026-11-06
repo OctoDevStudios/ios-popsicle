@@ -42,9 +42,9 @@ Percentages are the author's estimates of how far each part is from working as i
 
 | Component | Progress | Status | Notes |
 |---|---|---|---|
-| Wi-Fi: chip and firmware (WCN7880) | `██████░░░░` 60% | 🟠 | Firmware boots, but crashes on about two boots out of three |
-| Wi-Fi: scan | `████░░░░░░` 40% | 🟠 | Real networks seen on 2.4, 5 and 6 GHz, not yet reliable |
-| Wi-Fi: connection and data | `░░░░░░░░░░` 0% | ⚪ | wpa_supplicant not connected yet |
+| Wi-Fi: chip and firmware (WCN7880) | `███████░░░` 70% | 🟡 | Firmware boots. About one boot in five dies early, and it often hangs on the association request |
+| Wi-Fi: scan | `███████░░░` 70% | 🟡 | Works when the firmware survives. 2.4 GHz with the phone's own board file, 5 GHz not heard yet |
+| Wi-Fi: connection and data | `████░░░░░░` 35% | 🟠 | WPA2 connects on about one boot in ten. DHCP address and received traffic seen on a few boots. Ping and DNS not proven yet |
 | Wi-Fi: Settings panel and status icon | `░░░░░░░░░░` 0% | ⚪ | |
 | Modem firmware | `███████░░░` 70% | 🟡 | Boots fully with its services, all writes kept in RAM |
 | 4G/5G, calls, SMS, SIM | `░░░░░░░░░░` 0% | ⚪ | Not connected to iOS yet |
